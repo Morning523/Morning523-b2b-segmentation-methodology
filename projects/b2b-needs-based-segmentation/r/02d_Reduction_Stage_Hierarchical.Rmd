@@ -1,0 +1,810 @@
+---
+title: "Workstream 2d - Hierarchical Two-Stage Reduction (Stage 1: within-block EFA for F1/F3/ProviderPerception; Stage 2: combine with the WS1-needs 45-item FA factors) -- full 80-item coverage"
+author: "Ayan Nazm"
+date: "2026-08-05"
+output: html_document
+---
+
+<!--
+PORTFOLIO VERSION NOTICE (added for public portfolio use):
+This notebook is adapted from a real dissertation/consultancy segmentation
+project for public demonstration of methodology only. The client
+organisation's name, the original survey instrument's question wording, the
+raw respondent data, and all real result figures (segment sizes, loadings,
+percentages, model fit statistics) have been removed or genericised. Running
+this script as-is will not reproduce any real findings -- see
+`../../../data/README.md`. Co-developed with a dissertation teammate; see
+this project's README for the authorship breakdown.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE)
+```
+
+```{r libraries}
+required_pkgs <- c("readxl", "dplyr", "tidyr", "purrr", "stringr", "tibble",
+                    "psych", "GPArotation", "ggplot2", "writexl", "forcats", "MASS")
+new_pkgs <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+if (length(new_pkgs) > 0) install.packages(new_pkgs, dependencies = TRUE)
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+dplyr_verbs <- c("select", "filter", "mutate", "arrange", "summarise",
+                 "summarize", "group_by", "count", "distinct", "slice",
+                 "rename", "bind_rows", "pull", "left_join")
+for (v in dplyr_verbs) assign(v, get(v, envir = asNamespace("dplyr")))
+rm(v, dplyr_verbs)
+```
+
+```{r configuration}
+# ------------------------------------------------------------------------
+# 0. WHY THIS SCRIPT EXISTS
+# ------------------------------------------------------------------------
+# 02_Reduction_Stage.Rmd pools all 80 raw need items into one flat mixed-
+# type correlation matrix and gets KMO = 0.153 (unacceptable, Kaiser 1974).
+# 02c_Reduction_Stage_WS1Needs.Rmd pools only the 45 WS1-documented items
+# (C5c/F9a/F10/F5, dropping F1/F3/buying-criteria/category-perception) and
+# gets KMO = 0.973 (marvelous). Diagnosis (established in chat, not
+# re-derived here): C5c/F9a/F10 individually scored KMO 0.90-0.96 in
+# Workstream 1's own block-level EFA, and the 45-item pool's strong overall
+# KMO shows C5c+F9a+F10+F5 already share enough cross-block variance to
+# pool directly. F1 and F3 (30 items, current/planned tech adoption +
+# future-usefulness endorsement for the same technology list) are the
+# blocks that do NOT share that variance -- adding them to a flat pooled
+# matrix doesn't just fail to help, it drags every other item's MSA down
+# too, because KMO's partial correlation controls for every other item at
+# once (see reduction_item_msa.png from the 80-item run: literally all 80
+# items fail the 0.6 floor, including C5c items that scored 0.90+ alone).
+#
+# THIS SCRIPT keeps every one of the 80 items in play, but stops asking one
+# flat correlation matrix to explain all of them at once:
+#   STAGE 1: F1, F3, and a 5-item "ProviderPerception" block each get their
+#     own within-block suitability check + EFA (mirroring how Workstream 1
+#     already did this successfully for C5c/F9a/F10 individually) --
+#     varimax/orthogonal rotation, since a single narrow battery is exactly
+#     the case where near-independent factors are plausible a priori (same
+#     justification WS1 used). C5c/F9a/F10/F5's OWN-NEED items (the 45-item
+#     pool minus the 5 ProviderPerception items below) are NOT re-done here
+#     -- 02c already reduced them cleanly (KMO=0.973, 5 reliable factors)
+#     and that result is reused directly, not re-computed.
+#
+#     ProviderPerception is a NEW block added here (not present in the
+#     75-item version of this script) to close the gap identified when
+#     verifying "are all 80 items used": C5c_2r6 ("Providers understand the
+#     needs of modern businesses") and F10r2/r3/r7/r15 ("A well-known
+#     provider" / "Easy to access stores" / "Cheap prices" / "A company we
+#     can trust") were excluded from 02c's 45-item WS1-documented pool
+#     because WS1's own D1/D3 documents scoped them as provider-selection/
+#     buying-criteria items, not own-company operational needs -- a
+#     legitimate conceptual distinction, but one that meant they were never
+#     actually reduced or scored anywhere in this pipeline family. Grouping
+#     them into their own block lets the data test whether they cohere as a
+#     "how we judge/perceive a provider" dimension, on the same footing as
+#     every other block, rather than either silently dropping them or
+#     forcing them into blocks they don't conceptually belong to.
+#   STAGE 2: the resulting block-level factor scores (5 from 02c + however
+#     many F1 produces + however many F3 produces + however many
+#     ProviderPerception produces) are combined into one respondent-level,
+#     ALL-CONTINUOUS dataset. A second KMO/Bartlett check on THIS combined
+#     set is the headline diagnostic this script exists to produce -- if the
+#     hierarchical restructuring worked, this should sit far above 0.153
+#     (though, being a much smaller and already-reduced set of continuous
+#     scores rather than 80 raw mixed-type items, it is not numerically
+#     comparable to either prior KMO on a like-for-like basis; it answers
+#     "do these block-level summaries cohere", not "do the raw items
+#     cohere").
+# ------------------------------------------------------------------------
+ws1_reduction_rds <- "workstream2c_outputs_ws1needs/reduction_stage_objects_ws1needs.rds"
+data_path      <- "client_survey_data.xlsx"  # NOT INCLUDED in this repository -- see ../../../data/README.md
+value_map_path <- "value_label_map.csv"  # NOT INCLUDED -- original survey instrument wording is confidential
+output_dir        <- "workstream2d_outputs_hierarchical"
+dir.create(output_dir, showWarnings = FALSE)
+
+set.seed(1526)
+
+LOADING_CUTOFF   <- 0.40   # Albert (2003) / Dibb & Wensley (2002), consistent with the other scripts
+ALPHA_MIN        <- 0.70   # Nunnally (1978)
+KMO_MIN          <- 0.60   # Kaiser (1974) floor
+FACTOR_MIN_BLOCK <- 1      # sub-blocks are single narrow batteries -- unlike the pooled
+                           # stages (FACTOR_MIN=4), a clean 1-factor (summated-scale)
+                           # outcome is a perfectly good, arguably more interpretable,
+                           # result here, not a sign the search under-shot.
+```
+
+```{r load-ws1-factors}
+# ------------------------------------------------------------------------
+# 1. LOAD STAGE 1 (ALREADY DONE): THE 45-ITEM POOL'S 5 RELIABLE FA FACTORS
+# ------------------------------------------------------------------------
+stopifnot(
+  "02c_Reduction_Stage_WS1Needs.Rmd output not found -- knit that script first" =
+    file.exists(ws1_reduction_rds)
+)
+ws1_obj <- readRDS(ws1_reduction_rds)
+stopifnot(
+  "reduction_stage_objects_ws1needs.rds is missing expected components -- re-knit 02c_Reduction_Stage_WS1Needs.Rmd" =
+    all(c("fa_scores", "uuid", "firmographics", "factor_reliability") %in% names(ws1_obj))
+)
+
+need_fa_scores <- as.data.frame(ws1_obj$fa_scores)
+colnames(need_fa_scores) <- paste0("NeedFA", seq_len(ncol(need_fa_scores)))
+cat("Loaded", ncol(need_fa_scores), "reliable FA factor(s) from the 45-item WS1 pool for",
+    nrow(need_fa_scores), "respondents.\n")
+print(ws1_obj$factor_reliability[, c("factor", "n_items", "cronbach_alpha", "reliable")])
+
+need_fa_df <- bind_cols(tibble(uuid = ws1_obj$uuid), as_tibble(need_fa_scores))
+```
+
+```{r import}
+# ------------------------------------------------------------------------
+# 2. IMPORT RAW SURVEY DATA (needed fresh -- F1/F3 are not in 02c's RDS)
+# ------------------------------------------------------------------------
+raw <- read_excel(data_path, sheet = "A1", guess_max = 2000)
+df  <- raw %>% filter(status == "Qualified")
+cat("Retained", nrow(df), "qualified respondents\n")
+value_map <- read.csv(value_map_path, stringsAsFactors = FALSE, encoding = "UTF-8")
+
+stopifnot(
+  "Respondent counts differ between the 45-item pool's saved uuid and this fresh import -- re-knit 02c first if the raw data file has changed" =
+    nrow(df) == nrow(need_fa_df)
+)
+```
+
+```{r blocks}
+# ------------------------------------------------------------------------
+# 3. THE THREE BLOCKS THIS SCRIPT ADDS: F1, F3, AND PROVIDERPERCEPTION
+#    (F1/F3 variable definitions identical to 02_Reduction_Stage.Rmd's
+#    Section 3; ProviderPerception is the 5-item block new to this version,
+#    combining C5c_2r6 + F10r2/r3/r7/r15 -- reproduced here, not sourced, so
+#    this script is self-contained)
+# ------------------------------------------------------------------------
+block_ProviderPerception <- c(
+  C5c_2r6 = "Providers understand the needs of modern businesses",
+  F10r2   = "A well-known provider",
+  F10r3   = "Easy to access stores",
+  F10r7   = "Cheap prices",
+  F10r15  = "A company we can trust"
+)
+
+block_F3 <- c(
+  F3r1  = "Cloud-based storage solutions",
+  F3r2  = "Sovereign cloud",
+  F3r3  = "Network personalisation (NaaS with APIs)",
+  F3r4  = "Satellite / Non-Terrestrial Network connectivity",
+  F3r5  = "Data centres",
+  F3r6  = "Wholesale indirect and eSIM",
+  F3r7  = "SMB enablement (business-in-a-box)",
+  F3r8  = "Network monetisation",
+  F3r9  = "Digital vertical industry solutions (fintech, mobility tech)",
+  F3r10 = "IoT / machine-to-machine solutions",
+  F3r11 = "Digital assistants (AI virtual agents)",
+  F3r12 = "Mesh networks",
+  F3r13 = "AI as a Service",
+  F3r14 = "Blockchain",
+  F3r15 = "Next-gen predictive cybersecurity"
+)
+
+block_F1 <- setNames(unname(block_F3),
+                      c("F1r1","F1r2","F1r3","F1r4","F1r5","F1r6","F1r7","F1r8",
+                        "F1r9","F1r10","F1r11","F1r12","F1r13","F1r14","F1r15"))
+```
+
+```{r recoding}
+# ------------------------------------------------------------------------
+# 3.1 RECODING (identical logic/rationale to 02_Reduction_Stage.Rmd)
+# ------------------------------------------------------------------------
+recode_from_map <- function(data, vars, value_map) {
+  for (v in vars) {
+    lookup  <- value_map %>% filter(variable == v) %>% select(label, code) %>% distinct()
+    map_vec <- setNames(lookup$code, lookup$label)
+    data[[v]] <- unname(map_vec[as.character(data[[v]])])
+  }
+  data
+}
+recode_checkbox <- function(x) {
+  ifelse(is.na(x), NA_real_,
+         ifelse(stringr::str_starts(trimws(as.character(x)), "NO TO:"), 0, 1))
+}
+rebase_need_intensity <- function(x) {
+  ifelse(x %in% 1:5, 6 - x, NA_real_)   # code 6 ("not relevant") -> NA
+}
+extract_leading_int <- function(x) {
+  as.numeric(stringr::str_extract(trimws(as.character(x)), "^\\d+"))
+}
+
+# F1: exact-label recode, then re-based to a 1-5 need-intensity scale
+# (5 = currently use, 1 = not interested) -- same treatment as F5 elsewhere.
+df <- recode_from_map(df, names(block_F1), value_map)
+df[names(block_F1)] <- lapply(df[names(block_F1)], rebase_need_intensity)
+
+# F3: binary checkbox recode ("NO TO: ..." prefix = not endorsed).
+df[names(block_F3)] <- lapply(df[names(block_F3)], recode_checkbox)
+
+# ROBUSTNESS (added on code review): recode_checkbox matches a literal
+# "NO TO:" string prefix -- any label drift (typo, re-wording) would
+# silently fall through to "endorsed" (1) rather than raising an error.
+# F3 later returns a genuinely degenerate KMO (~0.02); before treating that
+# as a substantive finding rather than a recoding artefact, print each
+# item's endorsement rate so a rival explanation ("everything coded 1
+# because the string match failed") is checked, not assumed away (Browne's
+# Ten Critical Questions: are there rival explanations for this statistic?).
+f3_endorsement_rates <- sapply(df[names(block_F3)], function(x) mean(x == 1, na.rm = TRUE))
+cat("F3 item endorsement rates (share coded 1, i.e. NOT 'NO TO:'):\n")
+print(round(sort(f3_endorsement_rates), 3))
+if (any(f3_endorsement_rates > 0.98) || any(f3_endorsement_rates < 0.02)) {
+  cat("WARNING: at least one F3 item has a near-constant endorsement rate (>98% or <2%) --",
+      "check this item's raw label text/value_map entry before trusting F3's KMO as a genuine",
+      "finding rather than a recoding artefact.\n")
+}
+
+# ProviderPerception: C5c_2r6 -- REVERSE-CODED, same fix and same reasoning
+# as block_C5c in 02c_Reduction_Stage_WS1Needs.Rmd (2026-08): C5c's raw 1-7
+# codes run opposite to every other scale in this survey (confirmed via
+# cross-check against F5, not from documented scale anchors -- see 02c
+# Section 3.2 for the full evidence). F10r2/r3/r7/r15 are the hybrid
+# numeric/label 1-7 scale used for the rest of F10 (extract_leading_int) --
+# F10 IS documented low->high importance in the questionnaire, so those are
+# unaffected and need no re-basing.
+df[["C5c_2r6"]] <- 8 - as.numeric(df[["C5c_2r6"]])
+df[c("F10r2", "F10r3", "F10r7", "F10r15")] <-
+  lapply(df[c("F10r2", "F10r3", "F10r7", "F10r15")], extract_leading_int)
+
+f1_raw <- as.data.frame(df[, names(block_F1)])
+f3_raw <- as.data.frame(df[, names(block_F3)])
+provider_perception_raw <- as.data.frame(df[, names(block_ProviderPerception)])
+
+cat("F1 block:", nrow(f1_raw), "respondents x", ncol(f1_raw), "items | missingness range:",
+    round(min(sapply(f1_raw, function(x) mean(is.na(x)))) * 100, 1), "% -",
+    round(max(sapply(f1_raw, function(x) mean(is.na(x)))) * 100, 1), "%\n")
+cat("F3 block:", nrow(f3_raw), "respondents x", ncol(f3_raw), "items | missingness range:",
+    round(min(sapply(f3_raw, function(x) mean(is.na(x)))) * 100, 1), "% -",
+    round(max(sapply(f3_raw, function(x) mean(is.na(x)))) * 100, 1), "%\n")
+cat("ProviderPerception block:", nrow(provider_perception_raw), "respondents x",
+    ncol(provider_perception_raw), "items | missingness range:",
+    round(min(sapply(provider_perception_raw, function(x) mean(is.na(x)))) * 100, 1), "% -",
+    round(max(sapply(provider_perception_raw, function(x) mean(is.na(x)))) * 100, 1), "%\n")
+```
+
+```{r block-efa-function}
+# ------------------------------------------------------------------------
+# 4. REUSABLE WITHIN-BLOCK REDUCTION FUNCTION
+#    Same interpretability-screened factor-count search used pipeline-wide
+#    (02_Reduction_Stage.Rmd / 02c's Section 8), generalised into one
+#    function so it can be applied to F1 and F3 without duplicating ~150
+#    lines of logic twice. VARIMAX (orthogonal), not oblimin: a single
+#    narrow battery about one topic is exactly the case Workstream 1 used
+#    varimax for -- near-independent factors are plausible a priori within
+#    one block, unlike the pooled multi-block stages (02/02c), where
+#    oblique rotation was justified because correlated need dimensions
+#    become plausible once distinct blocks are combined (Costello &
+#    Osborne, 2005).
+# ------------------------------------------------------------------------
+alpha_reverse_scored <- function(raw_data, member_vars, loading_signs) {
+  item_data <- raw_data[, member_vars, drop = FALSE]
+  flip <- member_vars[loading_signs < 0]
+  if (length(flip) > 0) item_data[flip] <- -1 * item_data[flip]
+  suppressWarnings(psych::alpha(item_data, check.keys = FALSE))
+}
+
+run_block_reduction <- function(raw_data, item_labels, block_name, cor_type,
+                                 factor_min = FACTOR_MIN_BLOCK,
+                                 loading_cutoff = LOADING_CUTOFF,
+                                 alpha_min = ALPHA_MIN) {
+
+  cat("\n==============================\nBLOCK:", block_name, "\n")
+  vars <- names(item_labels)
+  n_avail <- colSums(!is.na(raw_data[vars]))
+  n_obs   <- round(mean(n_avail))
+
+  # --- ROBUSTNESS 1: per-item missingness table (not just the block-level
+  # min/max range printed at import time) -- an auditable record of exactly
+  # how much each item was imputed before scoring, and the trigger for the
+  # complete-case sensitivity check below. ---------------------------------
+  item_missingness <- tibble(block = block_name, variable = vars,
+                              item_label = unname(item_labels[vars]),
+                              pct_missing = round((1 - n_avail / nrow(raw_data)) * 100, 1))
+  cat(block_name, "item missingness (%):\n")
+  print(item_missingness[order(-item_missingness$pct_missing), c("variable", "pct_missing")])
+
+  # --- correlation matrix: appropriate to this block's single item type ---
+  # "pearson" added for ProviderPerception: its 5 items are all 7-point
+  # importance scales (>=5 categories), which 02c already treats as
+  # continuous for C5c/F9a/F10 under Rhemtulla et al. (2012) -- identical
+  # justification, reused rather than re-derived.
+  compute_rho <- function(data_subset, method) {
+    switch(method,
+      "polychoric"  = suppressWarnings(psych::polychoric(data_subset)$rho),
+      "tetrachoric" = suppressWarnings(psych::tetrachoric(data_subset)$rho),
+      "pearson"     = cor(data_subset, use = "pairwise.complete.obs"),
+      stop("cor_type must be 'polychoric', 'tetrachoric', or 'pearson'")
+    )
+  }
+  rho <- compute_rho(raw_data[vars], cor_type)
+  dimnames(rho) <- list(vars, vars)
+
+  eig_vals <- eigen(rho, symmetric = TRUE, only.values = TRUE)$values
+  n_neg <- sum(eig_vals < -1e-8)
+  if (n_neg > 0) {
+    cat("WARNING:", block_name, "correlation matrix not positive semi-definite --",
+        "applying psych::cor.smooth().\n")
+    rho <- psych::cor.smooth(rho)
+    dimnames(rho) <- list(vars, vars)
+  }
+
+  # --- ROBUSTNESS 2: matrix-conditioning check. Eigenvalue-negativity above
+  # only catches non-PD matrices; a matrix can be PD yet numerically
+  # ill-conditioned (near-singular), which is exactly the regime the
+  # MASS::ginv() scoring step below is compensating for. The condition
+  # number (Belsley, Kuh & Welsch, 1980) makes that risk visible rather than
+  # silently absorbed by ginv().
+  condition_number <- tryCatch(kappa(rho, exact = TRUE), error = function(e) NA_real_)
+  cat(block_name, "correlation matrix condition number (exact):", round(condition_number, 1), "\n")
+  if (!is.na(condition_number) && condition_number > 1000) {
+    cat("WARNING:", block_name, "rho is poorly conditioned (kappa >1000) -- MASS::ginv()",
+        "scoring below is the numerically appropriate response, but treat factor scores",
+        "from this block as approximate, not exact, regression estimates.\n")
+  }
+
+  # --- ROBUSTNESS 3: complete-case sensitivity check, auto-triggered when
+  # any item exceeds 20% missingness. Rules out "pairwise-complete-obs
+  # correlation estimation is distorting this block's suitability" as a
+  # rival explanation (Browne's Ten Critical Questions) before any KMO
+  # result below is interpreted substantively.
+  complete_case_kmo <- NA_real_
+  n_complete_case   <- NA_integer_
+  if (max(item_missingness$pct_missing) > 20) {
+    cc_idx <- stats::complete.cases(raw_data[vars])
+    n_complete_case <- sum(cc_idx)
+    cat(block_name, "has an item with >20% missingness -- running a complete-case-only",
+        "sensitivity check (n =", n_complete_case, "of", nrow(raw_data), "respondents):\n")
+    cc_rho <- tryCatch(compute_rho(raw_data[vars][cc_idx, , drop = FALSE], cor_type),
+                        error = function(e) NULL)
+    if (!is.null(cc_rho) && !anyNA(cc_rho)) {
+      dimnames(cc_rho) <- list(vars, vars)
+      complete_case_kmo <- tryCatch(psych::KMO(cc_rho)$MSA, error = function(e) NA_real_)
+    }
+    if (is.na(complete_case_kmo)) {
+      cat("Complete-case correlation/KMO could not be computed (too few complete cases",
+          "or a degenerate category) -- skipping this comparison.\n")
+    } else {
+      cat("Complete-case-only KMO will be compared to the pairwise-complete-obs KMO",
+          "once it is computed below.\n")
+    }
+  }
+
+  kmo_res  <- psych::KMO(rho)
+  bart_res <- psych::cortest.bartlett(rho, n = n_obs)
+  cat("KMO =", round(kmo_res$MSA, 3), "| Bartlett chi-sq =", round(bart_res$chisq, 1),
+      ", df =", bart_res$df, ", p =", signif(bart_res$p.value, 3), "\n")
+  if (is.na(kmo_res$MSA) || kmo_res$MSA < KMO_MIN) {
+    cat("WARNING: block KMO below", KMO_MIN, "-- inspect before trusting this block's factors.\n")
+  }
+  if (!is.na(complete_case_kmo)) {
+    cat("Complete-case-only KMO =", round(complete_case_kmo, 3),
+        "vs pairwise-complete-obs KMO =", round(kmo_res$MSA, 3), "-- ")
+    if (abs(complete_case_kmo - kmo_res$MSA) > 0.05) {
+      cat("these diverge by more than 0.05: missing-data handling materially affects this",
+          "block's suitability estimate, and should be named as a limitation.\n")
+    } else {
+      cat("these agree closely: the pairwise-complete-obs KMO is not an artefact of how",
+          "missing data were handled.\n")
+    }
+  }
+
+  pa <- psych::fa.parallel(rho, n.obs = n_obs, fa = "fa", n.iter = 100, plot = FALSE)
+  n_fact_ceiling <- max(1, pa$nfact)
+  cat("Parallel analysis suggests", n_fact_ceiling, "factor(s)\n")
+
+  evaluate_k <- function(k) {
+    fit <- tryCatch(
+      suppressWarnings(psych::fa(rho, nfactors = k, n.obs = n_obs,
+                                  rotate = if (k == 1) "none" else "varimax", fm = "minres")),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) return(NULL)
+    heywood <- any(fit$communality > 1.001, na.rm = TRUE)
+    load_df <- as.data.frame(unclass(fit$loadings))
+    k_cols  <- names(load_df)
+    load_df$variable <- rownames(load_df)
+    assign_k <- function(row) {
+      vals <- as.numeric(row[k_cols])
+      best <- which.max(abs(vals))
+      if (abs(vals[best]) >= loading_cutoff) k_cols[best] else NA_character_
+    }
+    load_df$assigned <- apply(load_df[k_cols], 1, assign_k)
+    rel <- purrr::map_dfr(k_cols, function(fc) {
+      member_vars <- load_df$variable[load_df$assigned == fc & !is.na(load_df$assigned)]
+      if (length(member_vars) < 3) {
+        return(tibble(factor = fc, n_items = length(member_vars),
+                       cronbach_alpha = NA_real_, reliable = FALSE))
+      }
+      signs <- sign(load_df[[fc]][load_df$variable %in% member_vars])
+      a <- alpha_reverse_scored(raw_data, member_vars, signs)
+      tibble(factor = fc, n_items = length(member_vars),
+             cronbach_alpha = a$total$raw_alpha,
+             reliable = isTRUE(a$total$raw_alpha >= alpha_min))
+    })
+    list(k = k, fit = fit, heywood = heywood,
+         n_degenerate = sum(!rel$reliable) + as.integer(heywood),
+         n_unassigned = sum(is.na(load_df$assigned)))
+  }
+
+  k_candidates <- factor_min:n_fact_ceiling
+  search <- purrr::compact(purrr::map(k_candidates, evaluate_k))
+  names(search) <- vapply(search, function(r) as.character(r$k), character(1))
+  search_summary <- purrr::map_dfr(search, function(r) {
+    tibble(k = r$k, heywood_case = r$heywood, n_degenerate_factors = r$n_degenerate,
+           n_unassigned_items = r$n_unassigned)
+  })
+  cat("Factor-count search (k =", factor_min, "to", n_fact_ceiling, "):\n")
+  print(search_summary)
+
+  clean_k <- search_summary$k[search_summary$n_degenerate_factors == 0]
+  n_fact_optimal <- if (length(clean_k) > 0) max(clean_k) else {
+    min_degen <- min(search_summary$n_degenerate_factors)
+    kk <- max(search_summary$k[search_summary$n_degenerate_factors == min_degen])
+    cat("WARNING: no k fully clean; using k =", kk, "(fewest degenerate factors).\n")
+    kk
+  }
+  cat("Selected", n_fact_optimal, "factor(s) for", block_name, "\n")
+
+  fit <- search[[as.character(n_fact_optimal)]]$fit
+  print(fit$loadings, cutoff = loading_cutoff, sort = TRUE)
+
+  loadings_df <- as.data.frame(unclass(fit$loadings)) %>%
+    tibble::rownames_to_column("variable") %>%
+    mutate(item_label = unname(item_labels[variable]))
+  fac_cols <- setdiff(names(loadings_df), c("variable", "item_label"))
+  assign_factor <- function(row) {
+    vals <- as.numeric(row[fac_cols])
+    best <- which.max(abs(vals))
+    if (abs(vals[best]) >= loading_cutoff) fac_cols[best] else NA_character_
+  }
+  loadings_df$assigned_factor <- apply(loadings_df[fac_cols], 1, assign_factor)
+
+  # BUGFIX (2026-08-06, code-review item #1): evaluate_k() above requires
+  # >=3 assigned items for a factor to count as non-degenerate during the
+  # k-search (fewer items forces reliable=FALSE there, which drives which k
+  # gets selected) -- but this final table previously only excluded <2-item
+  # factors, so a 2-item factor already treated as "degenerate" during model
+  # selection could still be computed a REAL alpha here and reported
+  # reliable=TRUE if that alpha happened to clear alpha_min, contradicting
+  # its own degeneracy classification from the search. Fixed by capping
+  # `reliable` at the same n_items>=3 floor regardless of the computed
+  # alpha value -- a 2-item factor can now never show reliable=TRUE here.
+  # The numeric alpha itself is still computed and shown for n_items==2
+  # (rather than blanked to NA): it remains a useful diagnostic even when
+  # not trusted -- e.g. F3_Factor1's alpha=0.263 is itself informative
+  # evidence of how weak that 2-item factor is, and hiding it would lose
+  # that signal for no real gain. Only n_items<2 (alpha not even computable)
+  # returns NA, as before.
+  reliability_df <- purrr::map_dfr(fac_cols, function(fc) {
+    member_vars <- loadings_df$variable[loadings_df$assigned_factor == fc & !is.na(loadings_df$assigned_factor)]
+    if (length(member_vars) < 2) {
+      return(tibble(factor = fc, n_items = length(member_vars),
+                     items = paste(unname(item_labels[member_vars]), collapse = "; "),
+                     cronbach_alpha = NA_real_, reliable = FALSE))
+    }
+    signs <- sign(loadings_df[[fc]][loadings_df$variable %in% member_vars])
+    a <- alpha_reverse_scored(raw_data, member_vars, signs)
+    tibble(factor = fc, n_items = length(member_vars),
+           items = paste(unname(item_labels[member_vars]), collapse = "; "),
+           cronbach_alpha = round(a$total$raw_alpha, 3),
+           reliable = (length(member_vars) >= 3) && isTRUE(a$total$raw_alpha >= alpha_min))
+  })
+  cat("\n", block_name, "factor reliability:\n")
+  print(reliability_df)
+
+  # --- respondent-level factor scores ---------------------------------
+  # Orthogonal (varimax) rotation when k>1: pattern == structure, so no Phi
+  # correction is needed (unlike the pooled oblimin stages). k==1 has no
+  # rotation at all ("none" above) -- scoring collapses to the same
+  # regression-scoring formula with a single-column loadings matrix.
+  raw_imputed <- as.data.frame(lapply(raw_data[vars], function(x) {
+    x[is.na(x)] <- stats::median(x, na.rm = TRUE); x
+  }))
+  z <- scale(as.matrix(raw_imputed))
+  weights <- MASS::ginv(rho) %*% unclass(fit$loadings)
+  scores <- z %*% weights
+  colnames(scores) <- paste0(block_name, "_Factor", seq_len(ncol(scores)))
+
+  score_range <- range(scores)
+  cat(block_name, "score range:", round(score_range[1], 2), "to", round(score_range[2], 2), "\n")
+  if (max(abs(score_range)) > 20) {
+    cat("WARNING:", block_name, "scores exceed a plausible range -- inspect", block_name, "rho.\n")
+  }
+
+  # ROBUSTNESS (added on code review): min-max range alone can hide a small
+  # number of extreme respondents inside an otherwise reasonable-looking
+  # range (a heavy tail, not a shifted range). This matters specifically
+  # for a block whose rho is poorly conditioned (see condition_number
+  # above): MASS::ginv() on a near-singular matrix can amplify noise in
+  # near-null-space directions, so an unstable score may show up as a few
+  # extreme outliers rather than a uniformly implausible range. Report the
+  # SD and the count of |z|>3 outliers explicitly so this is visible even
+  # when the min-max range looks fine.
+  score_z <- scale(scores)
+  n_outlier_3sd <- sum(abs(score_z) > 3, na.rm = TRUE)
+  cat(block_name, "score SD:", paste(round(apply(scores, 2, sd), 2), collapse = ", "),
+      "| respondents with |z|>3 on any", block_name, "factor:", n_outlier_3sd,
+      "of", nrow(scores), "\n")
+  if (!is.na(condition_number) && condition_number > 1e6 && n_outlier_3sd > 0) {
+    cat("WARNING:", block_name, "combines a poorly-conditioned rho with", n_outlier_3sd,
+        "outlier score(s) -- treat this block's factor scores as noisy for those respondents",
+        "specifically, not just generally approximate.\n")
+  }
+
+  list(kmo = kmo_res$MSA, bartlett_p = bart_res$p.value, n_factors = n_fact_optimal,
+       loadings = loadings_df, reliability = reliability_df, scores = scores,
+       search_summary = search_summary, item_missingness = item_missingness,
+       condition_number = condition_number, complete_case_kmo = complete_case_kmo,
+       n_complete_case = n_complete_case)
+}
+```
+
+```{r run-f1-f3}
+# ------------------------------------------------------------------------
+# 5. STAGE 1b: RUN THE WITHIN-BLOCK REDUCTION FOR F1, F3, AND
+#    PROVIDERPERCEPTION
+# ------------------------------------------------------------------------
+f1_result <- run_block_reduction(f1_raw, block_F1, "F1", cor_type = "polychoric")
+f3_result <- run_block_reduction(f3_raw, block_F3, "F3", cor_type = "tetrachoric")
+pp_result <- run_block_reduction(provider_perception_raw, block_ProviderPerception,
+                                  "ProviderPerception", cor_type = "pearson")
+```
+
+```{r combine-stage2}
+# ------------------------------------------------------------------------
+# 6. STAGE 2: COMBINE THE 45-ITEM POOL'S 5 FA FACTORS WITH F1's, F3's, AND
+#    PROVIDERPERCEPTION's BLOCK-LEVEL FACTORS INTO ONE RESPONDENT-LEVEL,
+#    ALL-CONTINUOUS DATASET (full 80-item coverage)
+# ------------------------------------------------------------------------
+f1_scores_df <- bind_cols(tibble(uuid = df$uuid), as_tibble(f1_result$scores))
+f3_scores_df <- bind_cols(tibble(uuid = df$uuid), as_tibble(f3_result$scores))
+pp_scores_df <- bind_cols(tibble(uuid = df$uuid), as_tibble(pp_result$scores))
+
+combined_scores <- need_fa_df %>%
+  left_join(f1_scores_df, by = "uuid") %>%
+  left_join(f3_scores_df, by = "uuid") %>%
+  left_join(pp_scores_df, by = "uuid")
+
+# ROBUSTNESS (added on code review): a duplicate uuid in any of the four
+# score tables would silently fan out one of these left_joins (more rows
+# out than in), which the NA check below would NOT catch on its own -- a
+# fanned-out row still has no missing cells, just extra duplicated rows.
+stopifnot(
+  "combined_scores has a different respondent count than need_fa_df -- a left_join above fanned out (likely a duplicate uuid in f1/f3/pp_scores_df); investigate before proceeding" =
+    nrow(combined_scores) == nrow(need_fa_df)
+)
+
+stopifnot(
+  "Combined score matrix has missing cells -- every input score set should be complete for all respondents" =
+    sum(is.na(combined_scores)) == 0
+)
+
+score_cols <- setdiff(names(combined_scores), "uuid")
+cat("Combined hierarchical score set:", nrow(combined_scores), "respondents x",
+    length(score_cols), "block-level scores:", paste(score_cols, collapse = ", "), "\n")
+
+# --- Stage 2 suitability check: plain Pearson, since every input here is
+# already a continuous derived factor score (no more mixed-type problem to
+# solve -- that was already handled within each block in Stage 1). This is
+# NOT numerically comparable to the 80-item or 45-item KMOs on a like-for-
+# like basis: it is a much smaller matrix of already-reduced summaries, and
+# answers a different question ("do these block-level summaries cohere"),
+# not "do the 80 raw items cohere".
+combined_cor <- cor(combined_scores[, score_cols], use = "pairwise.complete.obs")
+combined_kmo  <- psych::KMO(combined_cor)
+combined_bart <- psych::cortest.bartlett(combined_cor, n = nrow(combined_scores))
+
+cat("\nStage 2 (combined block-level scores) suitability:\n")
+cat("KMO =", round(combined_kmo$MSA, 3), "| Bartlett chi-sq =", round(combined_bart$chisq, 1),
+    ", df =", combined_bart$df, ", p =", signif(combined_bart$p.value, 3), "\n")
+print(round(sort(combined_kmo$MSAi), 3))
+
+# ROBUSTNESS: same condition-number check applied to every Stage 1 block
+# (Section 4), applied here to the Stage 2 combined matrix -- this is the
+# matrix any downstream multivariate step (e.g. Mahalanobis-based methods)
+# would need to invert, so its conditioning matters just as much as each
+# block's own rho did.
+combined_condition_number <- tryCatch(kappa(combined_cor, exact = TRUE), error = function(e) NA_real_)
+cat("Stage 2 combined-score correlation matrix condition number (exact):",
+    round(combined_condition_number, 1), "\n")
+if (!is.na(combined_condition_number) && combined_condition_number > 1000) {
+  cat("WARNING: Stage 2 combined_cor is poorly conditioned (kappa >1000) -- inspect before",
+      "trusting downstream multivariate steps that invert it.\n")
+}
+
+tryCatch({
+  cor_df <- as.data.frame(combined_cor) %>% tibble::rownames_to_column("var1") %>%
+    tidyr::pivot_longer(-var1, names_to = "var2", values_to = "rho") %>%
+    mutate(var1 = factor(var1, levels = score_cols), var2 = factor(var2, levels = rev(score_cols)))
+  p_combined_cor <- ggplot2::ggplot(cor_df, ggplot2::aes(var1, var2, fill = rho)) +
+    ggplot2::geom_tile() + ggplot2::geom_text(ggplot2::aes(label = round(rho, 2)), size = 3) +
+    ggplot2::scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                                   midpoint = 0, limits = c(-1, 1), name = "r") +
+    ggplot2::labs(title = "Stage 2: correlations among combined block-level scores",
+                  subtitle = paste0("Overall KMO = ", round(combined_kmo$MSA, 3)), x = NULL, y = NULL) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+  print(p_combined_cor)
+  ggplot2::ggsave(file.path(output_dir, "hierarchical_stage2_correlation_heatmap.png"),
+                   plot = p_combined_cor, width = 8, height = 7, dpi = 300)
+}, error = function(e) cat("Stage 2 correlation heatmap skipped:", conditionMessage(e), "\n"))
+
+# NOTE: no further EFA/PCA collapse is forced here. The combined score set
+# (5 need factors + F1's + F3's block factors) is already a small number of
+# well-behaved continuous variables -- exactly the kind of input Ward's/
+# K-means/GMM already expect -- so it is carried into clustering AS-IS.
+# Forcing one more reduction pass on top risks re-introducing, in
+# miniature, the same pooling problem this whole design exists to avoid.
+```
+
+```{r score-traceability}
+# ------------------------------------------------------------------------
+# 6b. SCORE-TO-RAW-ITEM TRACEABILITY MAP + PER-SCORE RELIABILITY SUMMARY
+#     Built so the Clustering Stage can report which raw survey items sit
+#     behind each of the combined scores -- WBS Workstream 2 brief asks for
+#     "clear rules" and the variables that "define each segment", which is
+#     not answerable for this hierarchical design without reconciling FOUR
+#     separate loadings matrices (02c's 45-item pool + F1 + F3 +
+#     ProviderPerception) into one lookup. Also carries each score's Stage
+#     1 reliability verdict forward explicitly, so a score that failed the
+#     ALPHA_MIN bar (F3_Factor1, ProviderPerception_Factor1 in the current
+#     run) can never be presented downstream as equally trustworthy as one
+#     that passed it, without an explicit flag attached.
+# ------------------------------------------------------------------------
+# 45-item pool's NeedFA1..NeedFAk: column j of ws1_obj$fa_res$loadings is
+# NeedFA{j} by construction (see Section 1 -- need_fa_scores/need_fa_df
+# already assume this same positional correspondence). factor_reliability
+# is matched by NAME (not position) via match(), exactly the same safe
+# pattern already used for this same lookup in 02d_Clustering_Hierarchical.Rmd.
+ws1_fa_loadings_mat <- unclass(ws1_obj$fa_res$loadings)
+ws1_rel_idx <- match(colnames(ws1_fa_loadings_mat), ws1_obj$factor_reliability$factor)
+
+needfa_map <- purrr::map_dfr(seq_len(ncol(ws1_fa_loadings_mat)), function(j) {
+  score_col  <- paste0("NeedFA", j)
+  loadings_j <- ws1_fa_loadings_mat[, j]
+  assigned_vars <- names(loadings_j)[abs(loadings_j) >= LOADING_CUTOFF]
+  if (length(assigned_vars) == 0) return(NULL)
+  tibble(
+    score_col      = score_col,
+    source_block   = "45-item WS1 pool (02c)",
+    variable       = assigned_vars,
+    item_label     = unname(ws1_obj$item_labels[assigned_vars]),
+    loading        = round(loadings_j[assigned_vars], 3),
+    n_items        = ws1_obj$factor_reliability$n_items[ws1_rel_idx[j]],
+    cronbach_alpha = ws1_obj$factor_reliability$cronbach_alpha[ws1_rel_idx[j]],
+    reliable       = ws1_obj$factor_reliability$reliable[ws1_rel_idx[j]]
+  )
+})
+
+# F1/F3/ProviderPerception: score column names are "{block_name}_Factor{i}"
+# where i indexes fac_cols in the SAME order run_block_reduction() used to
+# build `scores` (see Section 4's "colnames(scores) <- paste0(block_name,
+# '_Factor', seq_len(ncol(scores)))") -- reproduced here by position, not
+# assumed to always be a single factor, so this stays correct even if a
+# future re-knit selects k>1 for one of these blocks.
+block_result_map <- function(result, score_prefix, source_block) {
+  ld <- result$loadings
+  fac_cols <- setdiff(names(ld), c("variable", "item_label", "assigned_factor"))
+  purrr::map_dfr(seq_along(fac_cols), function(i) {
+    fc <- fac_cols[i]
+    score_col <- paste0(score_prefix, "_Factor", i)
+    rows <- ld[!is.na(ld$assigned_factor) & ld$assigned_factor == fc, ]
+    if (nrow(rows) == 0) return(NULL)
+    rel_row <- result$reliability[result$reliability$factor == fc, ]
+    tibble(
+      score_col      = score_col,
+      source_block   = source_block,
+      variable       = rows$variable,
+      item_label     = rows$item_label,
+      loading        = round(rows[[fc]], 3),
+      n_items        = if (nrow(rel_row) > 0) rel_row$n_items[1] else nrow(rows),
+      cronbach_alpha = if (nrow(rel_row) > 0) rel_row$cronbach_alpha[1] else NA_real_,
+      reliable       = if (nrow(rel_row) > 0) rel_row$reliable[1] else NA
+    )
+  })
+}
+
+score_item_map <- bind_rows(
+  needfa_map,
+  block_result_map(f1_result, "F1", "F1 block (within-block EFA, 02d)"),
+  block_result_map(f3_result, "F3", "F3 block (within-block EFA, 02d)"),
+  block_result_map(pp_result, "ProviderPerception", "ProviderPerception block (within-block EFA, 02d)")
+)
+
+# Per-score-column reliability summary -- ONE row per column of
+# combined_scores (via a left_join against score_cols, not just the rows
+# that happened to have an assigned item), so a hypothetical score with
+# zero items above the loading cutoff would still appear here as an
+# explicit NA/unreliable row rather than silently vanishing.
+score_reliability <- tibble(score_col = score_cols) %>%
+  left_join(
+    score_item_map %>% distinct(score_col, source_block, n_items, cronbach_alpha, reliable),
+    by = "score_col"
+  )
+cat("\nScore reliability summary (carried forward to the Clustering Stage):\n")
+print(score_reliability)
+
+n_unreliable_scores <- sum(score_reliability$reliable %in% FALSE)
+if (n_unreliable_scores > 0) {
+  cat("\nNOTE:", n_unreliable_scores, "of", nrow(score_reliability),
+      "combined scores failed the ALPHA_MIN =", ALPHA_MIN, "reliability bar (",
+      paste(score_reliability$score_col[score_reliability$reliable %in% FALSE], collapse = ", "),
+      ") -- these are still carried into clustering (dropping them silently would lose real,",
+      "if noisily-measured, item coverage), but the Clustering Stage's robustness check re-runs",
+      "the recommended solution without them so their influence on segment boundaries is",
+      "reported explicitly, not assumed away.\n")
+}
+
+# Compact one-row-per-block diagnostics summary (KMO, condition number,
+# complete-case sensitivity KMO, retained factor count) for the three
+# blocks newly added in this script -- lets a reader see all three
+# robustness checks side by side without re-reading the console log.
+block_diagnostics <- tibble(
+  block             = c("F1", "F3", "ProviderPerception"),
+  kmo               = c(f1_result$kmo, f3_result$kmo, pp_result$kmo),
+  condition_number  = round(c(f1_result$condition_number, f3_result$condition_number,
+                               pp_result$condition_number), 1),
+  complete_case_kmo = c(f1_result$complete_case_kmo, f3_result$complete_case_kmo,
+                        pp_result$complete_case_kmo),
+  n_factors_selected = c(f1_result$n_factors, f3_result$n_factors, pp_result$n_factors)
+)
+cat("\nBlock diagnostics summary:\n"); print(block_diagnostics)
+
+item_missingness_all <- bind_rows(f1_result$item_missingness, f3_result$item_missingness,
+                                   pp_result$item_missingness)
+```
+
+```{r save-outputs}
+# ------------------------------------------------------------------------
+# 7. SAVE OUTPUTS FOR THE CLUSTERING STAGE
+# ------------------------------------------------------------------------
+writexl::write_xlsx(
+  list(
+    "Combined Respondent Scores" = combined_scores,
+    "F1 Loadings"                = f1_result$loadings,
+    "F1 Reliability"             = f1_result$reliability,
+    "F1 Factor Search"          = f1_result$search_summary,
+    "F3 Loadings"                = f3_result$loadings,
+    "F3 Reliability"             = f3_result$reliability,
+    "F3 Factor Search"          = f3_result$search_summary,
+    "ProviderPerception Loadings"     = pp_result$loadings,
+    "ProviderPerception Reliability"  = pp_result$reliability,
+    "ProviderPerception Factor Search" = pp_result$search_summary,
+    "Stage 2 Suitability"        = tibble(
+      metric = c("F1 block KMO", "F1 Bartlett p", "F1 n_factors", "F1 condition number", "F1 complete-case KMO",
+                 "F3 block KMO", "F3 Bartlett p", "F3 n_factors", "F3 condition number", "F3 complete-case KMO",
+                 "ProviderPerception block KMO", "ProviderPerception Bartlett p", "ProviderPerception n_factors",
+                 "ProviderPerception condition number", "ProviderPerception complete-case KMO",
+                 "Stage 2 combined KMO", "Stage 2 Bartlett p", "Stage 2 condition number", "N respondents"),
+      value  = c(round(f1_result$kmo, 3), signif(f1_result$bartlett_p, 3), f1_result$n_factors,
+                 round(f1_result$condition_number, 1), round(f1_result$complete_case_kmo, 3),
+                 round(f3_result$kmo, 3), signif(f3_result$bartlett_p, 3), f3_result$n_factors,
+                 round(f3_result$condition_number, 1), round(f3_result$complete_case_kmo, 3),
+                 round(pp_result$kmo, 3), signif(pp_result$bartlett_p, 3), pp_result$n_factors,
+                 round(pp_result$condition_number, 1), round(pp_result$complete_case_kmo, 3),
+                 round(combined_kmo$MSA, 3), signif(combined_bart$p.value, 3),
+                 round(combined_condition_number, 1), nrow(combined_scores))
+    ),
+    "Item Missingness"           = item_missingness_all,
+    "Block Diagnostics Summary"  = block_diagnostics,
+    "Score-to-Item Map"          = score_item_map,
+    "Score Reliability Summary"  = score_reliability
+  ),
+  path = file.path(output_dir, "Workstream2d_Reduction_Stage_Hierarchical.xlsx")
+)
+
+saveRDS(list(combined_scores = combined_scores, score_cols = score_cols,
+             uuid = df$uuid, firmographics = ws1_obj$firmographics,
+             f1_reliability = f1_result$reliability, f3_reliability = f3_result$reliability,
+             pp_reliability = pp_result$reliability,
+             combined_kmo = combined_kmo$MSA,
+             combined_condition_number = combined_condition_number,
+             score_item_map = score_item_map, score_reliability = score_reliability,
+             block_diagnostics = block_diagnostics, item_missingness = item_missingness_all),
+        file.path(output_dir, "hierarchical_reduction_objects.rds"))
+
+cat("\nOutputs written to:", normalizePath(output_dir), "\n")
+cat("-> Workstream2d_Reduction_Stage_Hierarchical.xlsx (F1/F3/ProviderPerception block loadings+reliability, combined scores, Stage 2 suitability, item missingness, score traceability + reliability)\n")
+cat("-> hierarchical_reduction_objects.rds (combined score set + score-to-item map + reliability flags for the Clustering stage, full 80-item coverage)\n")
+```

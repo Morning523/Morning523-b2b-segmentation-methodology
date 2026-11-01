@@ -1,0 +1,1982 @@
+---
+title: "Workstream 2d - Needs-Based Clustering on the Hierarchical Two-Stage Reduction (Ward's Hierarchical, K-Means, Gaussian Mixture / Latent Profile Analysis)"
+author: "Ayan Nazm"
+date: "2026-08-05"
+output: html_document
+---
+
+<!--
+PORTFOLIO VERSION NOTICE (added for public portfolio use):
+This notebook is adapted from a real dissertation/consultancy segmentation
+project for public demonstration of methodology only. The client
+organisation's name, the original survey instrument's question wording, the
+raw respondent data, and all real result figures (segment sizes, loadings,
+percentages, model fit statistics) have been removed or genericised. Running
+this script as-is will not reproduce any real findings -- see
+`../../../data/README.md`. Co-developed with a dissertation teammate; see
+this project's README for the authorship breakdown.
+-->
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(psych)
+library(ggplot2)
+library(writexl)
+library(forcats)
+library(cluster)
+library(factoextra)
+library(NbClust)
+library(mclust)
+library(scales)
+
+# Additional packages needed for the segment-quality assessment, the
+# customer-to-segment assignment rules and the recommendation write-up
+# added below (Sections 12-16).
+new_needed <- c("fpc", "rpart", "rpart.plot", "knitr")
+missing_needed <- new_needed[!new_needed %in% installed.packages()[, "Package"]]
+if (length(missing_needed) > 0) install.packages(missing_needed, dependencies = TRUE)
+library(fpc)
+library(rpart)
+library(rpart.plot)
+library(knitr)
+
+# NbClust/psych/mclust/fpc/rpart etc. each pull in dependencies (e.g. MASS)
+# that define their OWN versions of common dplyr verb names, and those get
+# attached to the search path AFTER dplyr's -- so a bare call later in the
+# script can silently resolve to the wrong function instead of dplyr's. This
+# is exactly what produced two different "unimplemented type 'list' in
+# order()" crashes when this script was first built (once via a masked
+# select()/filter(), once via a masked count()) -- the error looks like a
+# data bug but is actually a name collision. Rather than fix verbs one at a
+# time as each new one surfaces, force EVERY commonly-clobbered dplyr verb to
+# resolve to dplyr's version, in the global environment, once, here -- after
+# all libraries (including the ones added just above) have loaded.
+dplyr_verbs <- c("select", "filter", "mutate", "arrange", "summarise",
+                  "summarize", "group_by", "count", "distinct", "slice",
+                  "rename", "bind_rows", "pull", "left_join", "inner_join",
+                  "full_join", "anti_join", "semi_join")
+for (v in dplyr_verbs) assign(v, get(v, envir = asNamespace("dplyr")))
+rm(v, dplyr_verbs)
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 0. CONFIGURATION
+# ------------------------------------------------------------------------
+# --- EDIT THIS PATH if the Reduction Stage output folder changes ---------
+reduction_rds_path <- "workstream2d_outputs_hierarchical/hierarchical_reduction_objects.rds"
+output_dir         <- "workstream2d_clustering_outputs_hierarchical"
+dir.create(output_dir, showWarnings = FALSE)
+
+set.seed(1526)
+
+# THIS VARIANT (02d) has no FA-vs-PCA choice to make: 02d_Reduction_Stage_
+# Hierarchical.Rmd produces exactly one combined score set (5 reliable FA
+# factors from the 45-item WS1 pool + F1's + F3's + ProviderPerception's own
+# within-block factors -- full 80-item coverage), not parallel FA/PCA
+# alternatives. SCORE_SET is kept only so the downstream
+# guards written for 02/02c (`identical(SCORE_SET, "fa")`, used to decide
+# whether the hard-coded FACTOR_THEMES/persona labels or the raw-variable
+# "Segment Defining Variables" mapping are safe to compute) continue to
+# resolve to FALSE here via R's `&&` short-circuit evaluation, rather than
+# silently reusing loadings/labels that don't apply to this hybrid score
+# set. Do not set this to "fa" or "pca" in this script.
+SCORE_SET <- "hierarchical"
+
+HIER_METHOD    <- "ward.D2"   # Ward's minimum-variance criterion (Ward, 1963)
+NBCLUST_MIN_K  <- 2
+NBCLUST_MAX_K  <- 8           # range for Ward's NbClust battery + K-means elbow/silhouette plots
+ENTROPY_MIN    <- 0.80        # classification-clarity threshold (Souza et al., 2019)
+KMO_MIN        <- 0.60        # Kaiser (1974) floor -- same constant/citation as
+                               # 02d_Reduction_Stage_Hierarchical.Rmd's KMO_MIN; redefined
+                               # here (added 2026-08-10) rather than imported, since this
+                               # script only reads reduction_obj's SAVED combined_kmo value,
+                               # not the Reduction script's own environment/constants -- used
+                               # in Section 15 to interpret that saved KMO against the same
+                               # floor it was checked against upstream.
+
+# FIXED (2026-08-02, after first real knit-through): the GMM/LPA exploratory
+# BIC search (Section 6) originally reused NBCLUST_MAX_K (8) as its own
+# ceiling. On the first run, BIC was STILL FALLING at k=8 (14162 -> 14144 ->
+# 14085 from k=6 to k=8) -- i.e. the search was cut off before finding
+# where BIC actually bottoms out, so "k=8 selected" in that run was really
+# "k=8 was the edge of the search window", not a genuine BIC minimum.
+# Decoupled into its own, wider ceiling so the unconstrained GMM diagnostic
+# gets a fair chance to find its true BIC minimum, without slowing down
+# NbClust's 26-index battery (which does not need as wide a range and is
+# already reasonably expensive at NBCLUST_MAX_K = 8).
+GMM_MIN_K <- NBCLUST_MIN_K
+GMM_MAX_K <- 15
+
+SHORTLIST_K             <- 4:6
+MIN_VIABLE_SEGMENT_PCT  <- 5    # segments below this share of respondents are
+                                  # treated as too small to action commercially
+DEFINING_NEED_Z         <- 0.30 # |standardised centroid| above which a need
+                                  # factor is "defining" for a segment -- used
+                                  # identically for all three methods now that
+                                  # all three operate on the same continuous
+                                  # factor-score representation
+STABILITY_B_DIST        <- 50   # bootstrap reps, Ward's/K-means (fpc::clusterboot)
+STABILITY_B_GMM         <- 30   # bootstrap reps, GMM/LPA (heavier per-rep cost --
+                                  # increase for the final dissertation run if
+                                  # runtime allows)
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 1. LOAD REDUCTION-STAGE OBJECTS (combined hierarchical scores + firmographics)
+#    THIS VARIANT (02d) consumes 02d_Reduction_Stage_Hierarchical.Rmd's output
+#    -- a two-stage design, not a flat pooled reduction: Stage 1 reuses
+#    02c's 5 reliable FA factors from the 45-item WS1 pool (KMO=0.973)
+#    unchanged, and separately runs its own within-block EFA for F1, F3, and
+#    ProviderPerception (C5c_2r6 + F10r2/r3/r7/r15 -- the 5 items that were
+#    previously excluded from every reduction in this pipeline family; F1/F3
+#    are the two blocks that made the original 80-item pool's KMO collapse
+#    to 0.153). Stage 2 combines all of those block-level factor scores into
+#    one respondent-level continuous dataset -- so, unlike 02/02c, EVERY one
+#    of the 80 raw items is now genuinely represented somewhere in this
+#    clustering input (not merely 75, as in the prior version of this
+#    script), never pooled into one single flat correlation matrix. See that script's
+#    header and WS1_50Item_Needs_Register.xlsx for the full reasoning. It
+#    exists alongside (not instead of) 02_Clustering.Rmd/02c_Clustering_
+#    WS1Needs.Rmd so all three item-pool/design choices can be compared. This
+#    script otherwise reuses the same method battery (Ward's/K-means/GMM-LPA
+#    + composite quality scoring) unchanged, so the comparison isolates the
+#    effect of the reduction design, not the clustering methodology. It does
+#    not re-import/re-recode the raw survey file or re-run any EFA itself: it
+#    consumes the Reduction Stage's saved respondent-level scores, respondent
+#    identifier and firmographic extract directly.
+# ------------------------------------------------------------------------
+stopifnot(
+  "Reduction Stage output not found -- knit 02d_Reduction_Stage_Hierarchical.Rmd first" =
+    file.exists(reduction_rds_path)
+)
+reduction_obj <- readRDS(reduction_rds_path)
+stopifnot(
+  "hierarchical_reduction_objects.rds is missing expected components -- re-knit 02d_Reduction_Stage_Hierarchical.Rmd with the current version of that script" =
+    all(c("combined_scores", "score_cols", "uuid", "firmographics") %in% names(reduction_obj))
+)
+# "score_item_map"/"score_reliability" are required as of the robustness-
+# improvement pass (2026-08-05): they drive the real Segment Defining
+# Variables mapping (Section 13c) and the ablation/sensitivity check
+# (Section 13d) below. Both need a fresh knit of the current Reduction
+# Stage script -- checked separately from the stopifnot above so the error
+# message points the analyst at exactly what to re-knit.
+stopifnot(
+  "hierarchical_reduction_objects.rds predates the robustness-improvement pass -- re-knit the current 02d_Reduction_Stage_Hierarchical.Rmd to generate score_item_map/score_reliability before knitting this script" =
+    all(c("score_item_map", "score_reliability") %in% names(reduction_obj))
+)
+# This variant has no per-raw-variable FA loadings matrix spanning the whole
+# combined score set (Stage 1 ran FOUR separate EFAs -- the 45-item pool's,
+# F1's, F3's, and ProviderPerception's -- each with its own loadings matrix
+# over a different item set, not one unified matrix). Rather than reconcile
+# four loadings tables into one "Segment Defining Variables" mapping (a real
+# but separate piece of work), that section is left to degrade gracefully
+# via the SCORE_SET guard below, exactly as the existing 02c code already
+# does when its own validity checks fail -- no behaviour needed here beyond
+# not claiming "fa"/"pca" as SCORE_SET (see Section 0).
+has_item_labels <- FALSE
+# IMPORTANT: this must check for the exact name "factor_reliability", not
+# "f1_reliability"/"f3_reliability"/"pp_reliability" -- Section 13b's lookup
+# code below reads `reduction_obj$factor_reliability` literally (inherited
+# unchanged from 02c), and that single unified component does not exist in
+# this RDS (Stage 1 produced three SEPARATE reliability tables instead, one
+# per block). Since "factor_reliability" is genuinely absent, this correctly
+# evaluates FALSE, which routes Section 13b to its existing NA-fallback
+# branch instead of crashing on `reduction_obj$factor_reliability$factor`
+# (NULL) being matched against a non-empty `num_cols`. The three real
+# reliability tables are still printed here for the console/report, just not
+# wired into that lookup.
+has_factor_reliability <- "factor_reliability" %in% names(reduction_obj)
+cat("F1 block factor reliability:\n"); print(reduction_obj$f1_reliability)
+cat("F3 block factor reliability:\n"); print(reduction_obj$f3_reliability)
+cat("ProviderPerception block factor reliability:\n"); print(reduction_obj$pp_reliability)
+
+cat("Loaded reduction-stage objects:", nrow(reduction_obj$combined_scores), "respondents,",
+    length(reduction_obj$score_cols), "combined block-level scores:",
+    paste(reduction_obj$score_cols, collapse = ", "), "\n")
+cat("Stage 2 (combined-score) suitability, from the Reduction Stage: KMO =",
+    round(reduction_obj$combined_kmo, 3), "\n")
+
+firmo <- reduction_obj$firmographics %>%
+  mutate(S2 = as.numeric(S2), S3 = as.numeric(S3))
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 2. BUILD THE CLUSTERING INPUT MATRIX
+#    Column names are kept exactly as the Reduction Stage produced them
+#    (NeedFA1-5, F1_FactorN, F3_FactorN) rather than renamed to a generic
+#    FA1..FAk sequence -- there is no single unified factor solution here to
+#    number that way, and the descriptive names make every downstream table
+#    (segment profiles, defining-variable lists) self-explanatory without
+#    needing a separate lookup.
+# ------------------------------------------------------------------------
+continuous_input <- reduction_obj$combined_scores
+num_cols <- reduction_obj$score_cols
+
+n_missing <- sum(is.na(continuous_input[num_cols]))
+cat("Clustering input: ", nrow(continuous_input), "respondents x", length(num_cols),
+    "combined hierarchical scores (", n_missing, "missing cells)\n")
+stopifnot(
+  "Clustering input has unexpected missing cells -- the Reduction Stage's combine step should leave 0 missing here" =
+    n_missing == 0
+)
+
+continuous_scaled <- scale(as.matrix(continuous_input[, num_cols]))
+rownames(continuous_scaled) <- continuous_input$uuid
+
+# ROBUSTNESS (added on code review): no multivariate outlier screening was
+# previously run before Euclidean-distance clustering (Ward's linkage in
+# particular is sensitive to outliers). This is not a scan-and-remove step --
+# no respondents are dropped -- just an explicit, auditable check so an
+# unusually influential respondent (e.g. one riding a poorly-conditioned
+# block's noisy factor score -- see the F3 condition-number warning in the
+# Reduction Stage) is visible before it can silently shape cluster boundaries.
+outlier_flags <- rowSums(abs(continuous_scaled) > 3) > 0
+n_outliers <- sum(outlier_flags)
+cat("Respondents with |z|>3 on at least one clustering-input factor score:",
+    n_outliers, "of", nrow(continuous_scaled),
+    paste0("(", round(100 * n_outliers / nrow(continuous_scaled), 1), "%)"), "\n")
+if (n_outliers > 0) {
+  cat("These respondents are NOT removed (Ward's/K-means/GMM below all still run on the full",
+      "sample) -- flagged so their influence on segment boundaries can be checked if a",
+      "solution looks driven by a small number of extreme cases.\n")
+}
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 3. DESCRIPTIVE CHECK OF THE CLUSTERING INPUTS
+#    ("Analyse survey responses" -- WBS Workstream 2 brief). Run before any
+#    clustering so scale, spread and redundancy issues are caught before
+#    they distort a distance-based solution. Redundancy is expected to be
+#    lower here than with raw-item inputs, since these are already reduced,
+#    largely orthogonal-by-construction factor scores (oblimin for the 5
+#    need factors, varimax within the F1 and F3 blocks) rather than raw
+#    items -- but cross-stage correlation (e.g. a need factor correlating
+#    with an F1/F3 block factor) is checked, not assumed, since Stage 1's
+#    three EFAs were run completely independently of one another.
+# ------------------------------------------------------------------------
+describe_needs <- psych::describe(continuous_input[, num_cols]) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("need_variable") %>%
+  select(need_variable, n, mean, sd, min, max, skew, kurtosis)
+cat("Descriptive statistics for the", length(num_cols), "clustering-input factor scores:\n")
+print(describe_needs)
+
+needs_cor <- cor(continuous_scaled, use = "pairwise.complete.obs")
+high_cor_pairs <- which(abs(needs_cor) > 0.8 & upper.tri(needs_cor), arr.ind = TRUE)
+if (nrow(high_cor_pairs) > 0) {
+  cat("\nWARNING: the following factor-score pairs correlate above |0.8| -- ",
+      "consider whether the oblique rotation is leaving near-duplicate factors:\n")
+  print(data.frame(var1 = rownames(needs_cor)[high_cor_pairs[, 1]],
+                    var2 = colnames(needs_cor)[high_cor_pairs[, 2]],
+                    r = round(needs_cor[high_cor_pairs], 2)))
+} else {
+  cat("\nNo factor-score pairs correlate above |0.8| -- no evidence of redundant ",
+      "clustering inputs distorting the distance metric.\n")
+}
+
+## FIGURE: correlation heatmap of every clustering-input factor score.
+if (requireNamespace("corrplot", quietly = TRUE)) {
+  corrplot::corrplot(needs_cor, method = "color", type = "upper", tl.cex = 0.8,
+                      tl.col = "black", order = "hclust",
+                      title = "Clustering-Input Factor-Score Correlation Matrix", mar = c(0, 0, 2, 0))
+} else {
+  heatmap(needs_cor, symm = TRUE, main = "Clustering-Input Factor-Score Correlation Matrix")
+}
+dev.copy(png, file.path(output_dir, "needs_correlation_heatmap.png"), width = 900, height = 800)
+invisible(dev.off())
+
+write.csv(describe_needs, file.path(output_dir, "Needs_Descriptive_Statistics.csv"),
+          row.names = FALSE)
+```
+
+TABLE: descriptive statistics for every clustering-input factor score.
+
+```{r, echo = FALSE, results = "asis"}
+print(knitr::kable(describe_needs, digits = 2,
+                    caption = "Descriptive statistics: clustering-input factor scores"))
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 4. WARD'S HIERARCHICAL CLUSTERING -- EXPLORATORY / UNCONSTRAINED PASS
+#    (STAGE 1 -- fixes k and starting centroids for the confirmatory
+#    K-means run in Section 5). This pass lets NbClust pick whatever k the
+#    internal validity indices favour with no constraint; Section 11 below
+#    separately generates a 4-6 segment shortlist regardless of what k this
+#    unconstrained diagnostic settles on, per the WBS brief's requirement
+#    for a commercially actionable 4-6 segment solution.
+# ------------------------------------------------------------------------
+dist_mat <- dist(continuous_scaled, method = "euclidean")
+hc_ward  <- hclust(dist_mat, method = HIER_METHOD)
+
+## FIGURE: full dendrogram (rendered inline, then saved to file).
+plot(hc_ward, labels = FALSE, main = "Ward's Hierarchical Clustering (Euclidean distance)",
+     xlab = "", sub = "")
+dev.copy(png, file.path(output_dir, "dendrogram.png"), width = 1200, height = 700)
+invisible(dev.off())
+
+# NbClust majority-rule across its full battery of internal validity
+# indices -- avoids anchoring the cluster-count decision on a single index.
+set.seed(1526)
+nb <- NbClust::NbClust(data = continuous_scaled, distance = "euclidean",
+                        min.nc = NBCLUST_MIN_K, max.nc = NBCLUST_MAX_K,
+                        method = HIER_METHOD, index = "all")
+
+# GUARDRAIL (added 2026-08-03, after the raw-items robustness-check script
+# turned up 3 impossible votes -- k=0 x2, k=1 x1 -- in an otherwise identical
+# NbClust call on 80-dimensional data): a handful of NbClust's ~26 internal
+# indices can return an out-of-range/placeholder code instead of a genuine
+# k within [min.nc, max.nc], apparently under numerical strain from high
+# dimensionality or edge-case index behaviour. `table(nb$Best.nc[1, ])` was
+# tallying these alongside real votes with no filter -- harmless while the
+# real majority is decisive, but a latent risk in a closer-margin run.
+# Filter to the valid, configured k range before tallying, and flag (not
+# silently drop) anything excluded so it stays auditable.
+raw_best_nc <- nb$Best.nc[1, ]
+invalid_votes <- raw_best_nc[!raw_best_nc %in% NBCLUST_MIN_K:NBCLUST_MAX_K]
+if (length(invalid_votes) > 0) {
+  cat("WARNING:", length(invalid_votes), "NbClust index(es) returned a k",
+      "outside the configured [", NBCLUST_MIN_K, ",", NBCLUST_MAX_K,
+      "] range -- excluded from the majority-vote tally:\n")
+  # useNA = "ifany": table() drops NA by default, which would silently
+  # under-report this breakdown relative to the length() count above
+  # whenever an index fails to compute at all (returns NA) rather than an
+  # out-of-range number -- exactly what happened in the raw-items script's
+  # first post-fix run (6 invalid votes by length(), but only 3 accounted
+  # for by table() before this change, because 3 were NA rather than 0/1).
+  print(table(invalid_votes, useNA = "ifany"))
+}
+k_votes <- table(raw_best_nc[raw_best_nc %in% NBCLUST_MIN_K:NBCLUST_MAX_K])
+cat("NbClust index votes by k (valid range only):\n"); print(k_votes)
+
+# ROBUSTNESS (added on code review): the guardrail above filters out-of-range
+# votes but doesn't confirm nothing else went missing -- e.g. an index that
+# errored internally and was silently excluded from nb$Best.nc altogether,
+# rather than returning an explicit out-of-range/NA code. Reconcile the
+# valid-vote count against the total number of indices NbClust attempted
+# (ncol(nb$Best.nc)) so a silent additional loss is visible, not assumed away.
+n_indices_total <- ncol(nb$Best.nc)
+n_accounted <- sum(k_votes) + length(invalid_votes)
+cat("NbClust index reconciliation:", n_accounted, "of", n_indices_total,
+    "indices accounted for (valid votes + flagged invalid votes).\n")
+if (n_accounted != n_indices_total) {
+  cat("WARNING:", n_indices_total - n_accounted, "index(es) are unaccounted for -- neither a",
+      "valid vote nor a flagged invalid vote. Some index likely failed silently; investigate",
+      "nb$Best.nc directly before treating the majority-rule k as fully audited.\n")
+}
+
+k_hier <- as.integer(names(sort(k_votes, decreasing = TRUE))[1])
+cat("\nSelected k (NbClust majority rule):", k_hier, "\n")
+
+## FIGURE: NbClust's index votes, so the majority-rule pick is visually
+## auditable rather than a single printed number.
+barplot(k_votes, col = "steelblue4",
+        main = "NbClust: number of indices favouring each k",
+        xlab = "Number of clusters (k)", ylab = "Number of indices")
+dev.copy(png, file.path(output_dir, "nbclust_votes.png"), width = 900, height = 600)
+invisible(dev.off())
+
+ward_clusters <- cutree(hc_ward, k = k_hier)
+ward_centroids <- t(sapply(sort(unique(ward_clusters)), function(cl) {
+  colMeans(continuous_scaled[ward_clusters == cl, , drop = FALSE])
+}))
+
+## FIGURE: dendrogram with the chosen k-cluster cut highlighted.
+plot(hc_ward, labels = FALSE, main = paste0("Ward's Hierarchical Clustering -- k = ", k_hier, " cut"),
+     xlab = "", sub = "")
+rect.hclust(hc_ward, k = k_hier, border = "firebrick3")
+dev.copy(png, file.path(output_dir, "dendrogram_cut.png"), width = 1200, height = 700)
+invisible(dev.off())
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 5. K-MEANS (STAGE 2 -- confirmatory, seeded from Ward's centroids;
+#    PLUS a random-start sensitivity check)
+# ------------------------------------------------------------------------
+# Confirmatory (two-stage) solution -- Muller & Hamm (2014) / Hair et al. (2010)
+km_confirmatory <- kmeans(continuous_scaled, centers = ward_centroids, iter.max = 100)
+
+# Sensitivity check: standard random-start K-means with the same k
+set.seed(1526)
+km_random <- kmeans(continuous_scaled, centers = k_hier, nstart = 25, iter.max = 100)
+
+ari_confirm_vs_random <- mclust::adjustedRandIndex(km_confirmatory$cluster, km_random$cluster)
+cat("Adjusted Rand Index, confirmatory (Ward-seeded) vs random-start K-means:",
+    round(ari_confirm_vs_random, 3),
+    "\n(closer to 1 = the confirmatory solution is not an artefact of seeding)\n")
+
+sil_km <- cluster::silhouette(km_confirmatory$cluster, dist_mat)
+cat("Confirmatory K-means mean silhouette width:", round(mean(sil_km[, 3]), 3), "\n")
+
+## FIGURE: within-cluster sum-of-squares elbow.
+p_wss <- factoextra::fviz_nbclust(continuous_scaled, kmeans, method = "wss", k.max = NBCLUST_MAX_K)
+print(p_wss)
+ggplot2::ggsave(file.path(output_dir, "elbow_wss.png"), p_wss, width = 9, height = 6)
+
+## FIGURE: average silhouette width by k.
+p_sil <- factoextra::fviz_nbclust(continuous_scaled, kmeans, method = "silhouette", k.max = NBCLUST_MAX_K)
+print(p_sil)
+ggplot2::ggsave(file.path(output_dir, "elbow_silhouette.png"), p_sil, width = 9, height = 6)
+
+## FIGURE: 2-D PCA projection of respondents, coloured by K-means
+## (confirmatory) cluster.
+pca_needs <- prcomp(continuous_scaled, scale. = FALSE)
+pca_var_pct <- round(100 * summary(pca_needs)$importance[2, 1:2], 1)
+pca_df <- tibble(
+  PC1 = pca_needs$x[, 1], PC2 = pca_needs$x[, 2],
+  cluster = as.factor(km_confirmatory$cluster)
+)
+p_pca_km <- ggplot2::ggplot(pca_df, ggplot2::aes(x = PC1, y = PC2, colour = cluster)) +
+  ggplot2::geom_point(alpha = 0.6, size = 1.6) +
+  ggplot2::labs(title = "K-means (confirmatory) solution -- PCA projection of respondents",
+                x = paste0("PC1 (", pca_var_pct[1], "% variance)"),
+                y = paste0("PC2 (", pca_var_pct[2], "% variance)"),
+                colour = "Cluster") +
+  ggplot2::theme_minimal()
+print(p_pca_km)
+ggplot2::ggsave(file.path(output_dir, "kmeans_pca_scatter.png"), p_pca_km, width = 8, height = 6)
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 6. GAUSSIAN MIXTURE MODEL / LATENT PROFILE ANALYSIS
+#    (continuous-data analogue of Latent Class Analysis)
+#    poLCA-style LCA requires categorical manifest variables; this script's
+#    clustering inputs are now continuous FA/PCA factor scores (Section 2),
+#    so the probabilistic/model-based third method is Latent Profile
+#    Analysis -- a finite Gaussian mixture model fit to continuous
+#    indicators (Vermunt & Magidson, 2002; Oberski, 2016) -- implemented via
+#    mclust::Mclust(), which additionally selects the best-fitting
+#    covariance structure (spherical/diagonal/ellipsoidal, equal or varying
+#    across classes) by BIC rather than assuming one shape. This mirrors the
+#    earlier categorical-LCA step this script used before the client's pivot as
+#    closely as the change in variable type allows: probabilistic class
+#    membership, entropy-based classification clarity, and BIC-based class-
+#    count selection are all retained.
+# ------------------------------------------------------------------------
+calc_entropy <- function(posterior) {
+  p <- posterior
+  p[p == 0] <- 1e-10   # avoid log(0)
+  raw_entropy <- -sum(p * log(p))
+  n <- nrow(posterior)
+  k <- ncol(posterior)
+  1 - raw_entropy / (n * log(k))
+}
+
+gmm_fit_table <- purrr::map_dfr(GMM_MIN_K:GMM_MAX_K, function(k) {
+  fit <- tryCatch(mclust::Mclust(continuous_scaled, G = k), error = function(e) NULL)
+  if (is.null(fit)) {
+    return(tibble(nclass = k, N = NA_integer_, npar = NA_integer_, loglik = NA_real_,
+                  BIC = NA_real_, AIC = NA_real_, entropy = NA_real_, model = NA_character_))
+  }
+  n_obs <- fit$n
+  npar  <- fit$df
+  ll    <- fit$loglik
+  # mclust's own $bic component uses the OPPOSITE sign convention to poLCA's
+  # (mclust: higher = better, = 2*loglik - npar*log(n)); recomputed here in
+  # the conventional "lower = better" form used for AIC/BIC everywhere else
+  # in this pipeline, to avoid a sign-convention mix-up when comparing.
+  bic_std <- -2 * ll + npar * log(n_obs)
+  aic_std <- -2 * ll + 2 * npar
+  ent <- calc_entropy(fit$z)
+  tibble(nclass = k, N = n_obs, npar = npar, loglik = ll,
+         BIC = bic_std, AIC = aic_std, entropy = round(ent, 3), model = fit$modelName)
+})
+cat("GMM/LPA model comparison across class counts:\n")
+print(gmm_fit_table)
+
+## FIGURE: BIC by class count.
+plot(gmm_fit_table$nclass, gmm_fit_table$BIC, type = "b", pch = 19,
+     xlab = "Number of classes", ylab = "BIC (lower = better fit)",
+     main = "GMM/LPA class-count fit (BIC)")
+dev.copy(png, file.path(output_dir, "gmm_fit.png"), width = 1000, height = 600)
+invisible(dev.off())
+
+# Selection rule: lowest BIC among class counts meeting the entropy >= 0.80
+# classification-clarity threshold (Souza et al., 2019); fall back to the
+# global BIC minimum if no class count clears that bar, flagging the
+# fallback explicitly so it gets scrutinised rather than silently accepted.
+eligible <- gmm_fit_table %>% filter(entropy >= ENTROPY_MIN, !is.na(BIC))
+if (nrow(eligible) > 0) {
+  k_gmm <- eligible$nclass[which.min(eligible$BIC)]
+  cat("\nSelected GMM/LPA class count (min BIC subject to entropy >=", ENTROPY_MIN, "):", k_gmm, "\n")
+} else {
+  k_gmm <- gmm_fit_table$nclass[which.min(gmm_fit_table$BIC)]
+  cat("\nWARNING: no class count reached entropy >=", ENTROPY_MIN,
+      "-- falling back to global BIC minimum:", k_gmm,
+      "-- inspect classification clarity before treating this as final.\n")
+}
+
+gmm_final <- mclust::Mclust(continuous_scaled, G = k_gmm)
+
+## FIGURE: profile heatmap for the selected GMM/LPA model -- centroid (mean
+## z-score per factor per class), the continuous-data equivalent of the
+## item-response-probability heatmap this script used for LCA previously.
+gmm_profile <- as.data.frame(t(gmm_final$parameters$mean)) %>%
+  tibble::rownames_to_column("class") %>%
+  mutate(class = paste0("Class ", class))
+gmm_profile_long <- tidyr::pivot_longer(gmm_profile, cols = -class, names_to = "need", values_to = "z")
+p_gmm_heat <- ggplot2::ggplot(gmm_profile_long, ggplot2::aes(x = need, y = class, fill = z)) +
+  ggplot2::geom_tile() +
+  ggplot2::scale_fill_gradient2(low = "steelblue4", mid = "white", high = "firebrick3", midpoint = 0) +
+  ggplot2::labs(title = paste0("GMM/LPA (", k_gmm, "-class) profile: mean factor score (z) by class"),
+                x = "Need factor", y = "Class", fill = "z-score") +
+  ggplot2::theme_minimal()
+print(p_gmm_heat)
+ggplot2::ggsave(file.path(output_dir, "gmm_profile_heatmap.png"), p_gmm_heat, width = 8, height = 5)
+```
+
+TABLE: GMM/LPA model comparison across class counts (BIC/AIC/entropy).
+
+```{r, echo = FALSE, results = "asis"}
+print(knitr::kable(gmm_fit_table, digits = 2, caption = "GMM/LPA fit indices by class count"))
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 7. TRIANGULATION ACROSS THE THREE SOLUTIONS
+#    Unlike this script's earlier LCA step (categorical items, na.rm = TRUE,
+#    could drop respondents with missing discrete items), all three methods
+#    here run on the SAME complete continuous_scaled matrix -- no
+#    respondent subsetting/alignment is needed before comparing solutions.
+# ------------------------------------------------------------------------
+assignments <- tibble(
+  uuid = continuous_input$uuid,
+  ward_cluster = ward_clusters,
+  kmeans_cluster = km_confirmatory$cluster,
+  kmeans_random_cluster = km_random$cluster,
+  gmm_class = gmm_final$classification
+)
+
+ari_table <- tibble(
+  comparison = c("Ward's vs K-means (confirmatory)",
+                  "Ward's vs GMM/LPA",
+                  "K-means (confirmatory) vs GMM/LPA"),
+  adjusted_rand_index = c(
+    mclust::adjustedRandIndex(assignments$ward_cluster, assignments$kmeans_cluster),
+    mclust::adjustedRandIndex(assignments$ward_cluster, assignments$gmm_class),
+    mclust::adjustedRandIndex(assignments$kmeans_cluster, assignments$gmm_class)
+  )
+)
+cat("\nCross-method triangulation (Adjusted Rand Index, Hubert & Arabie, 1985):\n")
+print(ari_table)
+
+## FIGURE: cross-tabulation heatmaps between each pair of solutions.
+plot_crosstab_heatmap <- function(data, col_a, col_b, label_a, label_b) {
+  tab <- data %>% count(!!rlang::sym(col_a), !!rlang::sym(col_b), name = "n")
+  names(tab)[1:2] <- c("a", "b")
+  ggplot2::ggplot(tab, ggplot2::aes(x = as.factor(a), y = as.factor(b), fill = n)) +
+    ggplot2::geom_tile() +
+    ggplot2::geom_text(ggplot2::aes(label = n), size = 3) +
+    ggplot2::scale_fill_gradient(low = "white", high = "steelblue4") +
+    ggplot2::labs(title = paste(label_a, "vs", label_b), x = label_a, y = label_b, fill = "N") +
+    ggplot2::theme_minimal()
+}
+p_ct1 <- plot_crosstab_heatmap(assignments, "ward_cluster", "kmeans_cluster", "Ward's cluster", "K-means cluster")
+p_ct2 <- plot_crosstab_heatmap(assignments, "ward_cluster", "gmm_class", "Ward's cluster", "GMM/LPA class")
+p_ct3 <- plot_crosstab_heatmap(assignments, "kmeans_cluster", "gmm_class", "K-means cluster", "GMM/LPA class")
+print(p_ct1); print(p_ct2); print(p_ct3)
+ggplot2::ggsave(file.path(output_dir, "triangulation_ward_vs_kmeans.png"), p_ct1, width = 6, height = 5)
+ggplot2::ggsave(file.path(output_dir, "triangulation_ward_vs_gmm.png"), p_ct2, width = 6, height = 5)
+ggplot2::ggsave(file.path(output_dir, "triangulation_kmeans_vs_gmm.png"), p_ct3, width = 6, height = 5)
+```
+
+TABLE: cross-method triangulation (Adjusted Rand Index).
+
+```{r, echo = FALSE, results = "asis"}
+print(knitr::kable(ari_table, digits = 3, caption = "Adjusted Rand Index across method pairs"))
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 8. EXTERNAL VALIDATION AGAINST FIRMOGRAPHICS (NOT USED IN CLUSTERING)
+# ------------------------------------------------------------------------
+profiling <- assignments %>% left_join(firmo, by = "uuid")
+
+validate_solution <- function(data, cluster_col, solution_label) {
+  cl <- data[[cluster_col]]
+  kw_s2 <- kruskal.test(data$S2 ~ as.factor(cl))
+  kw_s3 <- kruskal.test(data$S3 ~ as.factor(cl))
+  chi_s4 <- suppressWarnings(chisq.test(table(cl, data$S4)))
+  chi_d3 <- suppressWarnings(chisq.test(table(cl, data$D3)))
+  tibble(
+    solution = solution_label,
+    test = c("Kruskal-Wallis: employees (S2)", "Kruskal-Wallis: sites (S3)",
+             "Chi-square: sector (S4)", "Chi-square: turnover band (D3)"),
+    statistic = c(kw_s2$statistic, kw_s3$statistic, chi_s4$statistic, chi_d3$statistic),
+    p_value = c(kw_s2$p.value, kw_s3$p.value, chi_s4$p.value, chi_d3$p.value)
+  )
+}
+
+firmo_validation <- bind_rows(
+  validate_solution(profiling, "ward_cluster", "Ward's hierarchical"),
+  validate_solution(profiling, "kmeans_cluster", "K-means (confirmatory)"),
+  validate_solution(profiling, "gmm_class", "GMM/LPA")
+)
+cat("Firmographic external-validity tests (non-parametric; S2/S3 are ",
+    "right-skewed counts, so Kruskal-Wallis is used in place of ANOVA):\n")
+print(firmo_validation)
+```
+
+TABLE: firmographic external-validity tests, all three exploratory solutions.
+
+```{r, echo = FALSE, results = "asis"}
+print(knitr::kable(firmo_validation, digits = 3,
+                    caption = "Firmographic external-validity tests (S2/S3/S4/D3)"))
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 9. WARD'S / K-MEANS CLUSTER PROFILES
+#    (GMM/LPA's profile heatmap was already produced in Section 6)
+# ------------------------------------------------------------------------
+kmeans_profile <- as.data.frame(km_confirmatory$centers) %>% tibble::rownames_to_column("cluster")
+ward_profile <- as.data.frame(ward_centroids) %>% tibble::rownames_to_column("cluster")
+
+plot_centroid_heatmap <- function(profile_df, title) {
+  long <- tidyr::pivot_longer(profile_df, cols = -cluster, names_to = "need", values_to = "z")
+  ggplot2::ggplot(long, ggplot2::aes(x = need, y = as.factor(cluster), fill = z)) +
+    ggplot2::geom_tile() +
+    ggplot2::scale_fill_gradient2(low = "steelblue4", mid = "white", high = "firebrick3", midpoint = 0) +
+    ggplot2::labs(title = title, x = "Need factor", y = "Cluster", fill = "z-score") +
+    ggplot2::theme_minimal()
+}
+p_km_profile <- plot_centroid_heatmap(kmeans_profile, "K-means (confirmatory) cluster profile")
+p_ward_profile <- plot_centroid_heatmap(ward_profile, "Ward's hierarchical cluster profile")
+print(p_km_profile); print(p_ward_profile)
+ggplot2::ggsave(file.path(output_dir, "kmeans_profile_heatmap.png"), p_km_profile, width = 8, height = 5)
+ggplot2::ggsave(file.path(output_dir, "ward_profile_heatmap.png"), p_ward_profile, width = 8, height = 5)
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 10. SAVE EXPLORATORY OUTPUTS
+# ------------------------------------------------------------------------
+writexl::write_xlsx(
+  list(
+    "Respondent Assignments"       = profiling,
+    "Triangulation ARI"            = ari_table,
+    "Firmographic Validation"      = firmo_validation,
+    "KMeans Cluster Profile"       = kmeans_profile,
+    "Ward Cluster Profile"         = ward_profile,
+    "GMM Class Profile"            = gmm_profile,
+    "GMM Fit Comparison"           = gmm_fit_table,
+    "NbClust k Votes"              = as.data.frame(k_votes)
+  ),
+  path = file.path(output_dir, "Workstream2d_Clustering_Results_Hierarchical.xlsx")
+)
+
+cat("\nOutputs written to:", normalizePath(output_dir), "\n")
+cat("-> Workstream2d_Clustering_Results_Hierarchical.xlsx  (assignments, profiles, fit + triangulation tables)\n")
+cat("-> dendrogram.png / elbow_silhouette.png / gmm_fit.png (diagnostic plots)\n")
+
+#===============================================================================
+# NEXT STEPS FOR THE ANALYST (cannot be automated -- requires judgement):
+#  1. Inspect "GMM Fit Comparison" and the NbClust k-votes table together --
+#     if the methods suggest materially different cluster/class counts, that
+#     divergence needs discussing in the methodology chapter, not silently
+#     resolved.
+#  2. Review "Triangulation ARI" -- a low ARI between Ward's/K-means and
+#     GMM/LPA is a legitimate finding (different assumptions surface
+#     different structure) but must be explained, not treated as an error.
+#  3. Label each cluster/class using the profile heatmaps (centroid z-scores
+#     per need factor) -- assign commercially meaningful segment names once
+#     the profiles are reviewed.
+#  4. Decide and justify which solution is the PRIMARY reporting solution
+#     for Workstream 3 -- Sections 11-16 below narrow this to a shortlisted,
+#     quality-assessed 4-6 segment recommendation automatically, but the
+#     analyst should confirm or override it once the profiles are reviewed.
+#  5. Carry the chosen segment assignments forward into Workstream 3, joined
+#     to the firmographic profiling already computed here.
+#===============================================================================
+```
+
+The sections above (1-10) are exploratory: they let each method's own internal
+validity indices pick whatever cluster/class count they favour with no
+constraint, and triangulate/validate that unconstrained result. The sections
+below implement the remaining WBS Workstream 2 activities that specifically
+require a **commercially actionable, 4-6 segment** answer: segment quality
+assessment (size, distinctiveness, stability, interpretability), shortlisting
+and recommending a final 4-6 segment model, defining customer-to-segment
+assignment rules, and a final rationale-and-limitations write-up.
+
+```{r}
+# ------------------------------------------------------------------------
+# 11. SHORTLIST CANDIDATE SOLUTIONS AT k = 4, 5, 6
+#     ("Identify clusters... using various clustering methodologies" +
+#     "Define and recommend 4-6 needs-based customer segments shortlisted
+#     from Workstream 1" -- WBS Workstream 2 brief). A candidate solution is
+#     generated for EVERY method x k combination in the 4-6 range, so the
+#     quality-assessment step below (Section 12) can compare all nine on a
+#     like-for-like basis rather than assuming each method's unconstrained
+#     optimum (Sections 4-6) is automatically the best 4-6-segment answer.
+# ------------------------------------------------------------------------
+generate_ward_kmeans <- function(k) {
+  wc <- cutree(hc_ward, k = k)
+  wcent <- t(sapply(sort(unique(wc)), function(cl) {
+    colMeans(continuous_scaled[wc == cl, , drop = FALSE])
+  }))
+  km <- kmeans(continuous_scaled, centers = wcent, iter.max = 100)
+  list(ward = wc, kmeans = km$cluster, kmeans_obj = km)
+}
+candidate_dist <- purrr::map(SHORTLIST_K, generate_ward_kmeans)
+names(candidate_dist) <- paste0("k", SHORTLIST_K)
+
+generate_gmm <- function(k) mclust::Mclust(continuous_scaled, G = k)
+candidate_gmm <- purrr::map(SHORTLIST_K, generate_gmm)
+names(candidate_gmm) <- paste0("k", SHORTLIST_K)
+
+cat("Generated", length(SHORTLIST_K) * 3, "candidate solutions (",
+    paste(SHORTLIST_K, collapse = ", "), "segments x Ward's/K-means/GMM-LPA)\n")
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 12. SEGMENT QUALITY ASSESSMENT -- SIZE, DISTINCTIVENESS, STABILITY,
+#     INTERPRETABILITY ("Assess segment quality based on size,
+#     distinctiveness, stability and interpretability" -- WBS Workstream 2
+#     brief). Applied to all nine k=4-6 candidates from Section 11. Because
+#     all three methods now share the same continuous factor-score
+#     representation, distinctiveness (eta-squared) and interpretability
+#     (defining-need count, DEFINING_NEED_Z) are computed IDENTICALLY for
+#     all three -- unlike this script's earlier categorical-LCA version,
+#     which had to combine LCA entropy and distance-based eta-squared on one
+#     normalised scale as a documented limitation. Only the STABILITY
+#     estimator still differs by method family: Jaccard co-membership
+#     bootstrap for the two distance-based methods (fpc::clusterboot), and a
+#     posterior-based bootstrap Adjusted Rand Index for the model-based
+#     GMM/LPA, since GMM classifications are probabilistic rather than
+#     assigned by a fixed distance rule.
+# ------------------------------------------------------------------------
+assess_distance_quality <- function(labels, method_label, k) {
+  n <- length(labels)
+  size_tab <- table(labels) / n * 100
+  min_size <- min(size_tab)
+
+  eta_sq <- sapply(colnames(continuous_scaled), function(v) {
+    a <- summary(aov(continuous_scaled[, v] ~ as.factor(labels)))
+    a[[1]]["as.factor(labels)", "Sum Sq"] / sum(a[[1]][, "Sum Sq"])
+  })
+  distinctiveness <- mean(eta_sq)
+
+  sil <- mean(cluster::silhouette(labels, dist_mat)[, 3])
+
+  set.seed(1526)
+  if (method_label == "Ward's hierarchical") {
+    cb <- fpc::clusterboot(continuous_scaled, B = STABILITY_B_DIST,
+                            clustermethod = fpc::hclustCBI, k = k,
+                            method = "ward.D2", count = FALSE)
+  } else {
+    cb <- fpc::clusterboot(continuous_scaled, B = STABILITY_B_DIST,
+                            clustermethod = fpc::kmeansCBI, k = k,
+                            count = FALSE)
+  }
+  stability <- mean(cb$bootmean)
+
+  centroids <- sapply(colnames(continuous_scaled), function(v) {
+    tapply(continuous_scaled[, v], labels, mean)
+  })
+  n_defining <- rowSums(abs(centroids) >= DEFINING_NEED_Z)
+  interpretability <- mean(n_defining)
+  pct_uninterpretable <- mean(n_defining == 0) * 100
+
+  stopifnot(
+    "distinctiveness must be scalar" = length(distinctiveness) == 1,
+    "sil must be scalar" = length(sil) == 1,
+    "stability must be scalar" = length(stability) == 1,
+    "interpretability must be scalar" = length(interpretability) == 1,
+    "pct_uninterpretable must be scalar" = length(pct_uninterpretable) == 1
+  )
+
+  tibble(
+    method = method_label, k = k, n_used = n,
+    min_segment_pct = round(min_size, 1),
+    any_segment_below_min = min_size < MIN_VIABLE_SEGMENT_PCT,
+    distinctiveness_eta_sq = round(distinctiveness, 3),
+    mean_silhouette = round(sil, 3),
+    entropy = NA_real_,
+    stability_index = round(stability, 3),
+    mean_defining_needs = round(interpretability, 2),
+    pct_segments_uninterpretable = round(pct_uninterpretable, 1)
+  )
+}
+
+# --- GMM/LPA quality assessment --------------------------------------------
+assess_gmm_quality <- function(fit, k) {
+  n <- fit$n
+  size_tab <- table(fit$classification) / n * 100
+  min_size <- min(size_tab)
+  ent <- calc_entropy(fit$z)
+
+  centroids <- t(fit$parameters$mean)
+  n_defining <- rowSums(abs(centroids) >= DEFINING_NEED_Z)
+  interpretability <- mean(n_defining)
+  pct_uninterpretable <- mean(n_defining == 0) * 100
+
+  set.seed(1526)
+  orig_class <- fit$classification
+  boot_ari <- replicate(STABILITY_B_GMM, {
+    tryCatch({
+      idx <- sample(seq_len(nrow(continuous_scaled)), replace = TRUE)
+      boot_fit <- mclust::Mclust(continuous_scaled[idx, ], G = k)
+      pred <- predict(boot_fit, newdata = continuous_scaled)
+      mclust::adjustedRandIndex(orig_class, pred$classification)
+    }, error = function(e) NA_real_)
+  })
+  stability <- mean(boot_ari, na.rm = TRUE)
+
+  stopifnot(
+    "ent must be scalar" = length(ent) == 1,
+    "stability must be scalar" = length(stability) == 1,
+    "interpretability must be scalar" = length(interpretability) == 1,
+    "pct_uninterpretable must be scalar" = length(pct_uninterpretable) == 1
+  )
+
+  tibble(
+    method = "GMM/LPA", k = k, n_used = n,
+    min_segment_pct = round(min_size, 1),
+    any_segment_below_min = min_size < MIN_VIABLE_SEGMENT_PCT,
+    distinctiveness_eta_sq = NA_real_,
+    mean_silhouette = NA_real_,
+    entropy = round(ent, 3),
+    stability_index = round(stability, 3),
+    mean_defining_needs = round(interpretability, 2),
+    pct_segments_uninterpretable = round(pct_uninterpretable, 1)
+  )
+}
+
+quality_table <- bind_rows(
+  purrr::map2_dfr(SHORTLIST_K, candidate_dist, function(k, cand) {
+    assess_distance_quality(cand$ward, "Ward's hierarchical", k)
+  }),
+  purrr::map2_dfr(SHORTLIST_K, candidate_dist, function(k, cand) {
+    assess_distance_quality(cand$kmeans, "K-means (confirmatory)", k)
+  }),
+  purrr::map2_dfr(SHORTLIST_K, candidate_gmm, function(k, fit) {
+    assess_gmm_quality(fit, k)
+  })
+)
+
+# Composite quality score (0-1, higher = better): an unweighted average of
+# four min-max-normalised sub-scores (size adequacy, distinctiveness/
+# entropy, stability, interpretability). This is a transparent SHORTLISTING
+# heuristic to narrow nine candidates down for close reading -- not a
+# statistical test -- the final choice in Section 13 still requires the
+# analyst's substantive judgement (WBS brief: "recommend the final
+# segmentation model with rationale").
+norm01 <- function(x) {
+  x[is.na(x)] <- min(x, na.rm = TRUE)
+  if (diff(range(x)) == 0) return(rep(1, length(x)))
+  (x - min(x)) / diff(range(x))
+}
+quality_table <- quality_table %>%
+  mutate(
+    size_score = norm01(pmin(min_segment_pct, 15)),
+    interpretability_score = norm01(mean_defining_needs)
+  )
+# size_score and interpretability_score are deliberately left normalised
+# GLOBALLY across all 9 candidates -- not an oversight. min_segment_pct and
+# mean_defining_needs are computed via the IDENTICAL formula for every
+# method (the same "% of respondents in the smallest segment"; the same
+# count of factors clearing |z| >= DEFINING_NEED_Z), so there is no
+# different-statistics scale-mixing risk of the kind separation_score had.
+# stability_score does NOT get the same pass -- see the fix below.
+
+# FIXED (2026-08-02, after first real knit-through): separation is measured
+# on two DIFFERENT statistics depending on method family -- eta-squared
+# (variance explained by cluster) for the two distance-based methods, vs.
+# posterior entropy (classification clarity) for GMM/LPA. The original
+# implementation min-max-normalised both together on ONE shared scale via
+# `norm01(ifelse(method == "GMM/LPA", entropy, distinctiveness_eta_sq))`.
+# On the first real run, entropy (0.73-0.78 across all 3 GMM candidates)
+# happened to sit on a numerically higher range than eta-squared
+# (0.40-0.55 across all 6 distance-based candidates) -- so EVERY GMM
+# candidate scored near 1.0 and EVERY Ward's/K-means candidate scored near
+# 0 on this sub-score, regardless of which candidates were actually more
+# separated. That artifact was the dominant reason GMM/LPA k=4 (composite
+# 0.852) beat K-means k=4 (composite 0.544, despite K-means k=4 having far
+# higher bootstrap stability: 0.833 vs 0.549) in that run. Fixed by
+# normalising each family against its OWN candidates only -- eta-squared is
+# still directly comparable BETWEEN Ward's and K-means (same statistic,
+# same data), just no longer forced onto the same scale as GMM's entropy.
+is_gmm <- quality_table$method == "GMM/LPA"
+quality_table$separation_score <- NA_real_
+quality_table$separation_score[is_gmm]  <- norm01(quality_table$entropy[is_gmm])
+quality_table$separation_score[!is_gmm] <- norm01(quality_table$distinctiveness_eta_sq[!is_gmm])
+
+# FIXED (2026-08-03): stability_score carried the same latent scale-mixing
+# risk separation_score originally had, just less consequential so far.
+# Ward's/K-means stability_index is a Jaccard bootstrap co-membership mean
+# (fpc::clusterboot); GMM/LPA's is a posterior-classification bootstrap
+# Adjusted Rand Index (Section 12, assess_gmm_quality). Both are
+# conventionally read as "0 = unstable, 1 = perfectly stable", but they are
+# different estimators with no guarantee of occupying the same numeric
+# range on a given dataset -- exactly the reasoning that motivated splitting
+# separation_score. Normalised per method family here for consistency.
+quality_table$stability_score <- NA_real_
+quality_table$stability_score[is_gmm]  <- norm01(quality_table$stability_index[is_gmm])
+quality_table$stability_score[!is_gmm] <- norm01(quality_table$stability_index[!is_gmm])
+
+quality_table <- quality_table %>%
+  mutate(composite_quality = round((size_score + separation_score + stability_score +
+                                       interpretability_score) / 4, 3))
+cat("Segment quality assessment across all 9 candidate (method x k) solutions:\n")
+print(quality_table %>% select(method, k, min_segment_pct, distinctiveness_eta_sq,
+                                 entropy, stability_index, mean_defining_needs,
+                                 composite_quality))
+
+## FIGURE: composite quality score by method x k.
+p_quality <- ggplot2::ggplot(quality_table,
+                              ggplot2::aes(x = as.factor(k), y = composite_quality, fill = method)) +
+  ggplot2::geom_col(position = "dodge") +
+  ggplot2::geom_text(ggplot2::aes(label = composite_quality),
+                      position = ggplot2::position_dodge(width = 0.9), vjust = -0.3, size = 3) +
+  ggplot2::labs(title = "Segment quality assessment: composite score by method x segment count",
+                x = "Number of segments (k)", y = "Composite quality score (0-1)", fill = "Method") +
+  ggplot2::theme_minimal()
+print(p_quality)
+ggplot2::ggsave(file.path(output_dir, "quality_comparison.png"), p_quality, width = 9, height = 6)
+```
+
+TABLE: full segment quality assessment across all nine candidates.
+
+```{r, echo = FALSE, results = "asis"}
+print(knitr::kable(quality_table %>%
+                      select(method, k, min_segment_pct, distinctiveness_eta_sq, entropy,
+                             stability_index, mean_defining_needs, composite_quality),
+                    digits = 3, caption = "Segment quality assessment (9 candidates)"))
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 12b. ALL-CANDIDATES PROFILE COMPARISON (added on user request, 2026-08-06)
+#      The Section 13 recommendation only ever plots ONE profile heatmap --
+#      the programmatic winner's. On reviewing the recommended K-means k=4
+#      solution, 3 of its 4 segments looked visually "flat" (most |z| under
+#      0.8) next to one sharply differentiated segment. Section 3's
+#      correlation heatmap explains why structurally: 6 of the 8 clustering
+#      inputs are moderately-to-strongly positively intercorrelated (a
+#      dominant general need-intensity axis), while NeedFA3 ("provider needs
+#      a deep understanding of our business" + 4 related relationship/
+#      account-management items) ran strongly negative against that axis in
+#      the original (pre-2026-08-22) run. UPDATED 2026-08-22: C5c's raw items
+#      were found to be reverse-coded and fixed (see 02c Section 3.2). Since
+#      NeedFA3 is now the mirror image of before, its correlation with every
+#      other factor flips sign too (corr(-X,Y) = -corr(X,Y)) -- it now runs
+#      strongly POSITIVE against the dominant axis instead, i.e. it no longer
+#      acts as a countervailing dimension (sign flip is mathematically
+#      certain; exact new correlation magnitude not independently re-pulled
+#      from a printed matrix here). If anything this makes segments even
+#      more likely to differ along one dominant tilt rather than in sharply
+#      distinct shapes, so eta-squared of 0.42 (K-means k=4) still reflects
+#      that honestly rather than indicating weak clustering.
+#      This section makes that trade-off visually inspectable rather than
+#      asserted: every one of the 9 shortlisted candidates gets its own
+#      profile panel, labelled with its own composite_quality score, so
+#      "does k=5/6 actually look meaningfully more differentiated" can be
+#      judged directly against the quality/stability cost already quantified
+#      in Section 12's table, instead of guessed at from the single winner.
+# ------------------------------------------------------------------------
+build_candidate_profile <- function(labels, method_label, k) {
+  centroids <- sapply(colnames(continuous_scaled), function(v) {
+    tapply(continuous_scaled[, v], labels, mean)
+  })
+  as.data.frame(centroids) %>%
+    tibble::rownames_to_column("segment") %>%
+    mutate(method = method_label, k = k)
+}
+
+all_candidate_profiles <- bind_rows(
+  purrr::map2_dfr(SHORTLIST_K, candidate_dist, function(k, cand) {
+    build_candidate_profile(cand$ward, "Ward's hierarchical", k)
+  }),
+  purrr::map2_dfr(SHORTLIST_K, candidate_dist, function(k, cand) {
+    build_candidate_profile(cand$kmeans, "K-means (confirmatory)", k)
+  }),
+  purrr::map2_dfr(SHORTLIST_K, candidate_gmm, function(k, fit) {
+    build_candidate_profile(fit$classification, "GMM/LPA", k)
+  })
+)
+
+# Panel order/labels follow quality_table's own row order (method blocks of
+# k=4,5,6 each) and fold in each candidate's composite_quality score
+# directly into the facet strip, so distinctiveness and quality/stability
+# can be read side by side rather than cross-referenced against a separate
+# table.
+# BUGFIX (caught on visual QA of the first re-knit): the original panel
+# labels ("Ward's hierarchical, k=4  (composite=0.377)", ~44 characters)
+# were wider than facet_wrap allocates per strip at this plot size and got
+# clipped on BOTH edges -- "Ward's" lost its leading W, composite values
+# were cut off entirely for the K-means row. ggplot doesn't auto-wrap or
+# auto-shrink strip text, so the fix is to shorten the source strings, not
+# the theme: abbreviate the method name and split the k/quality onto a
+# second line via "\n" so each line only needs to fit ~12 characters.
+method_abbrev <- c("Ward's hierarchical" = "Ward's", "K-means (confirmatory)" = "K-means",
+                    "GMM/LPA" = "GMM/LPA")
+panel_order <- paste0(quality_table$method, ", k=", quality_table$k)
+panel_lookup <- setNames(
+  paste0(method_abbrev[quality_table$method], ", k=", quality_table$k,
+         "\n(q=", quality_table$composite_quality, ")"),
+  panel_order
+)
+all_candidate_profiles_long <- all_candidate_profiles %>%
+  mutate(panel_key = paste0(method, ", k=", k),
+         panel = factor(panel_lookup[panel_key], levels = unname(panel_lookup[panel_order]))) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(num_cols), names_to = "need", values_to = "z")
+
+p_all_candidates <- ggplot2::ggplot(all_candidate_profiles_long,
+                                     ggplot2::aes(x = need, y = segment, fill = z)) +
+  ggplot2::geom_tile() +
+  ggplot2::geom_text(ggplot2::aes(label = sprintf("%+.1f", z)), size = 2.2) +
+  ggplot2::scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+                                  name = "z-score") +
+  ggplot2::facet_wrap(~ panel, ncol = 3) +
+  # BUGFIX: this subtitle (~170 characters) was also clipped at the plot
+  # edge -- shortened to fit; "q" is defined inline since the full
+  # composite_quality name no longer appears in the (now-abbreviated)
+  # panel titles either.
+  ggplot2::labs(title = "Segment profiles across all 9 shortlisted candidates",
+                subtitle = "q = composite_quality (Section 12) -- a higher q already prices in the stability cost of a sharper split",
+                x = NULL, y = "Segment") +
+  ggplot2::theme_minimal(base_size = 9) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(size = 6, angle = 45, hjust = 1),
+                 strip.text = ggplot2::element_text(face = "bold", size = 7.5))
+print(p_all_candidates)
+ggplot2::ggsave(file.path(output_dir, "all_candidates_profile_comparison.png"), p_all_candidates,
+                 width = 15, height = 11)
+cat("\nAll 9 candidate profiles saved to all_candidates_profile_comparison.png -- use this to",
+    "judge whether a higher-k solution's extra distinctiveness is worth its lower composite_quality",
+    "and stability_index (see Section 12's table) before overriding the Section 13 recommendation.\n")
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 13. RECOMMENDED SEGMENTATION MODEL -- FINAL SELECTION + PROFILES
+#     ("Recommend the final segmentation model with rationale and
+#     limitations" -- WBS Workstream 2 brief)
+# ------------------------------------------------------------------------
+# Selection rule: highest composite_quality among candidates with NO segment
+# below the minimum viable size; ties broken by stability. This programmatic
+# pick is a starting point for the analyst to confirm or override once the
+# profiles below are reviewed -- not a black box (see Section 15).
+viable <- quality_table %>% filter(!any_segment_below_min)
+if (nrow(viable) == 0) {
+  cat("\nWARNING: every candidate has at least one segment below",
+      MIN_VIABLE_SEGMENT_PCT, "% -- selecting on composite_quality alone; ",
+      "review segment sizes before treating this as final.\n")
+  viable <- quality_table
+}
+best <- viable %>% arrange(desc(composite_quality), desc(stability_index)) %>% slice(1)
+cat("\nRECOMMENDED SOLUTION (programmatic shortlist pick -- confirm before finalising):\n")
+print(best)
+
+REC_METHOD <- best$method
+REC_K      <- best$k
+
+if (REC_METHOD == "GMM/LPA") {
+  rec_fit <- candidate_gmm[[paste0("k", REC_K)]]
+  rec_labels_df <- tibble(uuid = continuous_input$uuid, segment = rec_fit$classification)
+  rec_profile <- as.data.frame(t(rec_fit$parameters$mean)) %>% tibble::rownames_to_column("segment")
+} else {
+  cand <- candidate_dist[[paste0("k", REC_K)]]
+  rec_labels <- if (REC_METHOD == "Ward's hierarchical") cand$ward else cand$kmeans
+  rec_labels_df <- tibble(uuid = continuous_input$uuid, segment = rec_labels)
+  rec_profile <- as.data.frame(sapply(colnames(continuous_scaled), function(v) {
+    tapply(continuous_scaled[, v], rec_labels, mean)
+  })) %>% tibble::rownames_to_column("segment")
+}
+
+rec_size <- rec_labels_df %>% count(segment) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+cat("\nRecommended segmentation -- segment sizes:\n"); print(rec_size)
+
+## FIGURE: recommended segmentation -- segment size chart.
+p_rec_size <- ggplot2::ggplot(rec_size, ggplot2::aes(x = as.factor(segment), y = pct)) +
+  ggplot2::geom_col(fill = "darkorange3") +
+  ggplot2::geom_text(ggplot2::aes(label = paste0(pct, "%")), vjust = -0.3) +
+  ggplot2::geom_hline(yintercept = MIN_VIABLE_SEGMENT_PCT, linetype = "dashed", colour = "grey40") +
+  ggplot2::labs(title = paste0("Recommended segmentation (", REC_METHOD, ", k = ", REC_K, "): segment sizes"),
+                subtitle = "Dashed line = minimum viable segment size",
+                x = "Segment", y = "% of respondents") +
+  ggplot2::theme_minimal()
+print(p_rec_size)
+ggplot2::ggsave(file.path(output_dir, "recommended_segment_sizes.png"), p_rec_size, width = 8, height = 5)
+
+## FIGURE: recommended segmentation -- need profile.
+rec_profile_long <- tidyr::pivot_longer(rec_profile, cols = -segment, names_to = "need", values_to = "z")
+p_rec_profile <- ggplot2::ggplot(rec_profile_long,
+                                  ggplot2::aes(x = need, y = as.factor(segment), fill = z)) +
+  ggplot2::geom_tile() +
+  ggplot2::scale_fill_gradient2(low = "steelblue4", mid = "white", high = "firebrick3", midpoint = 0) +
+  ggplot2::labs(title = paste0("Recommended segmentation (", REC_METHOD, "): need profile (z-scores)"),
+                x = "Need factor", y = "Segment", fill = "z-score") +
+  ggplot2::theme_minimal()
+print(p_rec_profile)
+ggplot2::ggsave(file.path(output_dir, "recommended_profile.png"), p_rec_profile, width = 9, height = 5)
+
+## FIGURE: recommended segmentation on the same PCA projection of the need
+## space used in Section 5, so it can be visually compared to the
+## unconstrained K-means solution shown there.
+pca_rec_df <- tibble(uuid = rownames(continuous_scaled),
+                      PC1 = pca_needs$x[, 1], PC2 = pca_needs$x[, 2]) %>%
+  inner_join(rec_labels_df %>% mutate(segment = as.factor(segment)), by = "uuid")
+p_rec_pca <- ggplot2::ggplot(pca_rec_df, ggplot2::aes(x = PC1, y = PC2, colour = segment)) +
+  ggplot2::geom_point(alpha = 0.6, size = 1.6) +
+  ggplot2::labs(title = paste0("Recommended segmentation (", REC_METHOD, ", k = ", REC_K, ") -- PCA projection"),
+                x = "PC1", y = "PC2", colour = "Segment") +
+  ggplot2::theme_minimal()
+print(p_rec_pca)
+ggplot2::ggsave(file.path(output_dir, "recommended_pca_scatter.png"), p_rec_pca, width = 8, height = 6)
+
+## FIGURE: recommended segmentation vs firmographics (S2/S3/S4/D3) -- the
+## commercially actionable "who is in each segment" picture.
+rec_firmo <- rec_labels_df %>% mutate(segment = as.factor(segment)) %>% left_join(firmo, by = "uuid")
+
+p_rec_sector <- ggplot2::ggplot(rec_firmo %>% filter(!is.na(S4)),
+                                 ggplot2::aes(x = segment, fill = S4)) +
+  ggplot2::geom_bar(position = "fill") +
+  ggplot2::scale_y_continuous(labels = scales::percent) +
+  ggplot2::labs(title = "Recommended segmentation: sector composition (S4)",
+                x = "Segment", y = "% of segment", fill = "Sector") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.text = ggplot2::element_text(size = 7))
+print(p_rec_sector)
+ggplot2::ggsave(file.path(output_dir, "recommended_sector_composition.png"), p_rec_sector, width = 9, height = 6)
+
+p_rec_employees <- ggplot2::ggplot(rec_firmo %>% filter(!is.na(S2), S2 > 0),
+                                    ggplot2::aes(x = segment, y = S2)) +
+  ggplot2::geom_boxplot(fill = "lightsteelblue3") +
+  ggplot2::scale_y_log10() +
+  ggplot2::labs(title = "Recommended segmentation: employee count (S2, log scale)",
+                x = "Segment", y = "Employees (log10 scale)") +
+  ggplot2::theme_minimal()
+print(p_rec_employees)
+ggplot2::ggsave(file.path(output_dir, "recommended_employees_boxplot.png"), p_rec_employees, width = 8, height = 5)
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 13b. HIGH-LEVEL SEGMENT PROFILING (business-facing narrative + charts)
+#     Section 13's outputs are statistically complete but not something a
+#     client account team will read directly (factor z-scores, p-values). This
+#     section translates the recommended solution into named personas, a
+#     compact need-factor heatmap with plain-English factor labels, and a
+#     firmographic company-size comparison -- per the WBS brief's "equal
+#     emphasis on commercial applicability" mandate.
+#
+#     IMPORTANT -- FACTOR_THEMES and SEGMENT_THEMES below are ANALYST-
+#     ASSIGNED labels (2026-08-02), not computed from the data. They were
+#     written by reading the Reduction Stage's "FA Loadings (selected k)"
+#     top items per factor (FA1=MR4, FA2=MR5, FA3=MR3, FA4=MR1, FA5=MR2 in
+#     that stage's k=5 solution) and this script's Segment Profile +
+#     firmographic breakdown for the GMM/LPA k=4 recommended solution. Both
+#     guards below (`factor_labels_valid`, `segment_labels_valid`) check
+#     the CURRENT knit's inputs still match what these labels were written
+#     for; if the Reduction Stage's factor count/order changes, or a
+#     different method/k becomes the recommended solution, this section
+#     automatically falls back to generic FA1/FA2/... and "Segment 1/2/..."
+#     labels instead of silently mislabelling a different solution. If that
+#     happens, re-derive both lookups by re-reading the new Segment Profile
+#     and firmographic tables before re-enabling the custom labels.
+# ------------------------------------------------------------------------
+# ROBUSTNESS (added on code review): FACTOR_THEMES was previously left empty
+# for every SCORE_SET including "hierarchical", so the profiling heatmap and
+# the Segment Defining Variables sheet showed raw score codes (e.g.
+# "F3_Factor1") rather than a human-readable theme -- and the FA-specific
+# labels this section used to support required hand-deriving and manually
+# pasting a new lookup every time the recommended solution changed, exactly
+# the kind of label that goes stale silently (see git history / prior
+# comment). Auto-derive a short, self-updating theme label for each combined
+# score instead, from its own top-loading raw item in
+# `reduction_obj$score_item_map` (guaranteed present for this script -- see
+# Section 1's stopifnot) -- no manual re-derivation step required on future
+# re-knits, and it can never mismatch the currently-loaded solution the way a
+# hard-coded vector could.
+auto_factor_theme <- function(sc) {
+  if (!"score_item_map" %in% names(reduction_obj)) return(sc)
+  rows <- reduction_obj$score_item_map[reduction_obj$score_item_map$score_col == sc, ]
+  if (nrow(rows) == 0) return(sc)
+  top_label <- rows$item_label[which.max(abs(rows$loading))]
+  # BUGFIX (caught on visual QA of the first re-knit after this feature was
+  # added): some item labels are long ("Satellite / Non-Terrestrial Network
+  # connectivity", "Network personalisation (NaaS with APIs)") -- 8 of these
+  # side by side on one plot's x-axis overlapped into unreadable garbled text.
+  # Truncated here to a short phrase; kept single-line since this label is
+  # also used verbatim in the Segment Defining Variables xlsx export
+  # (Section 13c) -- the plot-only line-wrapped version is built separately,
+  # just below the profiling heatmap code, so the xlsx cell stays clean.
+  short_label <- if (nchar(top_label) > 22) paste0(substr(top_label, 1, 21), "…") else top_label
+  paste0(sc, " (", short_label, ")")
+}
+FACTOR_THEMES <- setNames(vapply(num_cols, auto_factor_theme, character(1)), num_cols)
+factor_labels_valid <- length(FACTOR_THEMES) > 0 && setequal(names(FACTOR_THEMES), num_cols)
+
+# ADDED (2026-08-10, critical-analysis pass): these four names/one-line
+# framings are analyst-authored (the underlying data pattern can be
+# auto-derived -- see seg_defining below -- but naming/commercial framing
+# genuinely requires judgement, per the note above). Written by reading
+# THIS run's live Segment Profile (Section 13) z-scores and the
+# firmographic breakdown (median employees/sites by segment, joined from
+# the raw firmographic file) for the CURRENT recommended solution
+# (K-means (confirmatory), k = 4) -- not carried over from an older run,
+# unlike the GMM/LPA-era labels this replaced.
+SEGMENT_THEMES <- c(
+  "1" = "Tech-Forward Enterprises",
+  "2" = "Value-Driven Operators",
+  "3" = "Minimal-Needs Micro Accounts",
+  "4" = "Modest-Expectation Larger Accounts"
+)
+# Re-uses the SAME defensive pattern as factor_labels_valid above: only
+# treat these labels as valid if the CURRENT run's recommended
+# method/k/segment-count still matches what they were written for. If a
+# future re-knit changes the recommendation (different method, different
+# k, or a different number of segments than SEGMENT_THEMES has names for),
+# this automatically flips back to FALSE and the NOTE/fallback logic below
+# fires -- exactly the staleness guard the removed persona_desc block
+# lacked.
+segment_labels_valid <- identical(REC_METHOD, "K-means (confirmatory)") &&
+  isTRUE(REC_K == 4) &&
+  setequal(names(SEGMENT_THEMES), as.character(sort(unique(rec_profile$segment))))
+
+if (!factor_labels_valid) {
+  cat("NOTE: FACTOR_THEMES labels do not match the current factor set (",
+      paste(num_cols, collapse = ", "), ") -- falling back to generic factor",
+      "labels in the profiling charts below. Re-derive FACTOR_THEMES from",
+      "the Reduction Stage's current 'FA Loadings (selected k)' sheet.\n")
+}
+if (!segment_labels_valid) {
+  cat("NOTE: SEGMENT_THEMES labels were written for the GMM/LPA k=4 solution",
+      "specifically; the current recommended solution is", REC_METHOD, "k =",
+      REC_K, "-- falling back to generic 'Segment N' labels below. Re-derive",
+      "SEGMENT_THEMES by re-reading the Segment Profile/firmographic tables",
+      "for this solution.\n")
+}
+
+factor_label_lookup <- if (factor_labels_valid) FACTOR_THEMES else setNames(num_cols, num_cols)
+segment_label_lookup <- function(seg) {
+  seg_chr <- as.character(seg)
+  if (segment_labels_valid && seg_chr %in% names(SEGMENT_THEMES)) {
+    paste0("Segment ", seg_chr, ": ", SEGMENT_THEMES[[seg_chr]])
+  } else {
+    paste0("Segment ", seg_chr)
+  }
+}
+
+## FIGURE: need-factor heatmap with plain-English factor labels -- a more
+## reader-friendly companion to the technical `p_rec_profile` heatmap
+## produced in Section 13.
+# BUGFIX: the auto-derived FACTOR_THEMES labels (e.g. "F3_Factor1 (Network
+# personalisation (NaaS wit…))") are too long to sit side-by-side as x-axis
+# text without overlapping -- confirmed on visual QA of the first re-knit.
+# Line-wrapping the item-label part (below) fixed most of it, but
+# "ProviderPerception_Factor1" alone is 27 characters -- long enough that
+# its wrapped label still overlapped its neighbour on the second re-knit's
+# visual QA. Re-derive the plot label from scratch (rather than
+# post-processing the xlsx-facing string) so the SCORE-CODE portion can
+# also be shortened for display, in addition to the item-label wrap --
+# `factor_label_lookup`/`FACTOR_THEMES` themselves are untouched and stay
+# full-length/single-line for the xlsx export.
+auto_factor_theme_plot <- function(sc) {
+  short_sc <- if (nchar(sc) > 12) paste0(substr(sc, 1, 11), "…") else sc
+  if (!"score_item_map" %in% names(reduction_obj)) return(short_sc)
+  rows <- reduction_obj$score_item_map[reduction_obj$score_item_map$score_col == sc, ]
+  if (nrow(rows) == 0) return(short_sc)
+  top_label <- rows$item_label[which.max(abs(rows$loading))]
+  short_label <- if (nchar(top_label) > 22) paste0(substr(top_label, 1, 21), "…") else top_label
+  paste0(short_sc, "\n(", short_label, ")")
+}
+plot_factor_label_lookup <- setNames(vapply(num_cols, auto_factor_theme_plot, character(1)), num_cols)
+profile_theme_df <- rec_profile
+matched_cols <- names(profile_theme_df) %in% names(plot_factor_label_lookup)
+names(profile_theme_df)[matched_cols] <- plot_factor_label_lookup[names(profile_theme_df)[matched_cols]]
+profile_theme_long <- tidyr::pivot_longer(profile_theme_df, cols = -segment, names_to = "need", values_to = "z")
+seg_levels <- sapply(sort(unique(profile_theme_df$segment)), segment_label_lookup)
+profile_theme_long$segment_label <- factor(sapply(profile_theme_long$segment, segment_label_lookup), levels = seg_levels)
+
+# ROBUSTNESS (added on code review): this subtitle was previously a
+# hard-coded caption about a specific factor ("BYOD/Cloud Storage",
+# alpha = -0.01) left over from an older FA-specific run of this section --
+# it no longer describes anything in this hierarchical score set, and would
+# now render on every knit since factor_labels_valid is TRUE above (it used
+# to gate this exact string). Replaced with a caption built from THIS run's
+# actual `reduction_obj$score_reliability` flags, so it can never show a
+# factor/alpha pair that isn't part of the current run.
+unreliable_theme_note <- {
+  ur <- reduction_obj$score_reliability$score_col[reduction_obj$score_reliability$reliable %in% FALSE]
+  if (length(ur) == 0) NULL else paste0("*", paste(ur, collapse = ", "),
+    " failed the Stage 1 reliability bar (Cronbach's alpha < 0.70) -- treat as directional only")
+}
+p_theme_heat <- ggplot2::ggplot(profile_theme_long, ggplot2::aes(x = need, y = segment_label, fill = z)) +
+  ggplot2::geom_tile() +
+  ggplot2::geom_text(ggplot2::aes(label = sprintf("%+.2f", z),
+                                    colour = abs(z) > 0.75), fontface = "bold", size = 3.2, show.legend = FALSE) +
+  ggplot2::scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black")) +
+  ggplot2::scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+                                  limits = c(-1.5, 1.5), name = "Standardised\nneed score (z)") +
+  ggplot2::labs(title = "What defines each segment: need-factor profile",
+                subtitle = unreliable_theme_note,
+                x = NULL, y = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(size = 7.5, angle = 20, hjust = 0.9, vjust = 1),
+                 plot.subtitle = ggplot2::element_text(size = 8, face = "italic", colour = "grey40"))
+print(p_theme_heat)
+# BUGFIX: widened from 10" to 13" (auto-derived labels are longer than the
+# generic score codes this plot was originally sized for -- see
+# auto_factor_theme above) so the two-line "code\n(short item)" labels have
+# room to render without overlapping.
+ggplot2::ggsave(file.path(output_dir, "profiling_need_heatmap.png"), p_theme_heat, width = 13, height = 5.5)
+
+## FIGURE: segment sizes with named-persona legend.
+rec_size_theme <- rec_size
+rec_size_theme$segment_label <- factor(sapply(rec_size_theme$segment, segment_label_lookup), levels = seg_levels)
+p_size_theme <- ggplot2::ggplot(rec_size_theme, ggplot2::aes(x = factor(segment), y = pct, fill = segment_label)) +
+  ggplot2::geom_col() +
+  ggplot2::geom_text(ggplot2::aes(label = paste0(pct, "%\n(n=", n, ")")), vjust = -0.15, fontface = "bold", size = 3.4) +
+  ggplot2::scale_y_continuous(limits = c(0, max(rec_size_theme$pct) * 1.25)) +
+  ggplot2::labs(title = "Segment sizes", x = "Segment", y = "% of respondents", fill = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(legend.position = "bottom") +
+  ggplot2::guides(fill = ggplot2::guide_legend(ncol = 1))
+print(p_size_theme)
+ggplot2::ggsave(file.path(output_dir, "profiling_segment_sizes.png"), p_size_theme, width = 8, height = 5.5)
+
+## FIGURE: company size by segment (median employees + median sites) -- the
+## sharpest firmographic differentiator found during profiling. Sector
+## composition (S4) was also checked and found to be broadly flat across
+## segments, so it is not repeated here
+## as a headline chart -- see `recommended_sector_composition.png`
+## (Section 13) for the full breakdown if needed.
+firmo_size_summary <- rec_firmo %>%
+  group_by(segment) %>%
+  summarise(median_employees = median(S2, na.rm = TRUE),
+            median_sites = median(S3, na.rm = TRUE), .groups = "drop")
+firmo_size_summary$segment_label <- factor(sapply(firmo_size_summary$segment, segment_label_lookup), levels = seg_levels)
+
+p_profiling_emp <- ggplot2::ggplot(firmo_size_summary, ggplot2::aes(x = factor(segment), y = median_employees, fill = segment_label)) +
+  ggplot2::geom_col() +
+  ggplot2::geom_text(ggplot2::aes(label = round(median_employees)), vjust = -0.3, fontface = "bold") +
+  ggplot2::scale_y_log10() +
+  ggplot2::labs(title = "Company size by segment", x = "Segment", y = "Median employees (log scale)", fill = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(legend.position = "bottom") +
+  ggplot2::guides(fill = ggplot2::guide_legend(ncol = 1))
+print(p_profiling_emp)
+ggplot2::ggsave(file.path(output_dir, "profiling_company_size.png"), p_profiling_emp, width = 7.5, height = 5.5)
+
+p_profiling_sites <- ggplot2::ggplot(firmo_size_summary, ggplot2::aes(x = factor(segment), y = median_sites, fill = segment_label)) +
+  ggplot2::geom_col(show.legend = FALSE) +
+  ggplot2::geom_text(ggplot2::aes(label = median_sites), vjust = -0.3, fontface = "bold") +
+  ggplot2::labs(title = "Number of sites by segment", x = "Segment", y = "Median number of sites") +
+  ggplot2::theme_minimal(base_size = 11)
+print(p_profiling_sites)
+ggplot2::ggsave(file.path(output_dir, "profiling_site_count.png"), p_profiling_sites, width = 6.5, height = 5)
+
+## Named, EXPORT-ONLY copies of the segment size/profile/assignment tables
+## (persona name added as a column) for the xlsx workbook in Section 16.
+## Kept SEPARATE from rec_labels_df itself, because rec_labels_df is also
+## the CART TRAINING TARGET in Section 14 -- joining a segment_persona
+## column into it there would hand the tree a column that is just a
+## renamed copy of the outcome, corrupting the "rules" it learns.
+rec_size_named      <- rec_size %>% mutate(segment_persona = sapply(segment, segment_label_lookup), .after = segment)
+rec_profile_named   <- rec_profile %>% mutate(segment_persona = sapply(segment, segment_label_lookup), .after = segment)
+rec_labels_df_named <- rec_labels_df %>% mutate(segment_persona = sapply(segment, segment_label_lookup), .after = segment)
+
+## ------------------------------------------------------------------------
+## Variable-level segment mapping: which RAW SURVEY VARIABLES (named
+## exactly as in the source data file -- see ../../../data/README.md,
+## e.g. "C5c_1r1", "F9ar6") define each segment's defining need factors.
+## Recomputed here directly from `reduction_obj$fa_res$loadings` -- NOT
+## hard-coded or re-read from a separately-saved lookup -- using the SAME
+## loading-cutoff assignment rule the Reduction Stage itself used
+## (LOADING_CUTOFF = 0.40), so this mapping automatically stays in sync
+## with whichever fa_res is currently loaded from reduction_stage_objects.rds
+## rather than silently drifting out of date if that script is re-run with
+## a different item set or factor solution.
+## ------------------------------------------------------------------------
+LOADING_CUTOFF_PROFILING <- 0.40   # must match LOADING_CUTOFF in 02c_Reduction_Stage_WS1Needs.Rmd
+fa_loadings_mat <- unclass(reduction_obj$fa_res$loadings)
+variable_mapping_valid <- identical(SCORE_SET, "fa") && ncol(fa_loadings_mat) == length(num_cols)
+
+# NEW (robustness-improvement pass, 2026-08-05): the hierarchical equivalent
+# of variable_mapping_valid above. This variant never has SCORE_SET == "fa"
+# (see Section 0), so the FA-specific branch above is always FALSE here --
+# this flag gates an INDEPENDENT branch below that builds the same
+# "Segment Defining Variables" output from `reduction_obj$score_item_map`
+# (built in 02d_Reduction_Stage_Hierarchical.Rmd's "score-traceability"
+# chunk by reconciling all FOUR of Stage 1's separate loadings matrices),
+# rather than leaving the mapping permanently inert for this variant.
+hierarchical_defining_vars_valid <- identical(SCORE_SET, "hierarchical") &&
+  all(c("score_item_map", "score_reliability") %in% names(reduction_obj))
+
+# Per-factor Cronbach's alpha / reliability flag, keyed to FA1..FA5 by
+# matching `factor_reliability$factor` (MR-named, e.g. "MR4") against
+# fa_loadings_mat's own column names -- POSITIONAL, not a hard-coded
+# MR->FA mapping, so it stays correct even if the Reduction Stage's factor
+# order/naming changes on a future re-run. A factor missing from
+# factor_reliability (e.g. it had fewer than 2 assigned items) or the
+# whole component being absent both degrade to NA rather than erroring.
+if (has_factor_reliability) {
+  rel_idx <- match(colnames(fa_loadings_mat), reduction_obj$factor_reliability$factor)
+  factor_alpha_lookup    <- setNames(reduction_obj$factor_reliability$cronbach_alpha[rel_idx], num_cols)
+  factor_reliable_lookup <- setNames(reduction_obj$factor_reliability$reliable[rel_idx], num_cols)
+} else {
+  factor_alpha_lookup    <- setNames(rep(NA_real_, length(num_cols)), num_cols)
+  factor_reliable_lookup <- setNames(rep(NA, length(num_cols)), num_cols)
+}
+
+if (variable_mapping_valid) {
+  assign_item_to_factor <- function(row) {
+    best <- which.max(abs(row))
+    if (abs(row[best]) >= LOADING_CUTOFF_PROFILING) num_cols[best] else NA_character_
+  }
+  item_factor_map <- apply(fa_loadings_mat, 1, assign_item_to_factor)
+  factor_variable_list <- setNames(
+    lapply(num_cols, function(fa) names(item_factor_map)[!is.na(item_factor_map) & item_factor_map == fa]),
+    num_cols
+  )
+
+  segment_defining_vars <- purrr::map_dfr(seq_len(nrow(rec_profile)), function(i) {
+    seg    <- as.character(rec_profile$segment[i])
+    z_vals <- unlist(rec_profile[i, num_cols])
+    defining_factors <- num_cols[abs(z_vals) >= DEFINING_NEED_Z]
+    purrr::map_dfr(defining_factors, function(fa) {
+      vars <- factor_variable_list[[fa]]
+      if (length(vars) == 0) return(NULL)
+      # Descriptive questionnaire text for each variable, e.g. "F1r2" ->
+      # "Sovereign cloud" -- looked up from the Reduction Stage's own
+      # `all_blocks` labels (saved as `item_labels` in the RDS), so the
+      # wording always matches that script's xlsx output exactly. Falls
+      # back to the raw code itself if `item_labels` wasn't available.
+      var_labels <- if (has_item_labels) {
+        looked_up <- unname(reduction_obj$item_labels[vars])
+        ifelse(is.na(looked_up), vars, looked_up)
+      } else {
+        vars
+      }
+      tibble::tibble(
+        segment         = seg,
+        segment_persona = segment_label_lookup(seg),
+        factor          = fa,
+        factor_theme    = if (factor_labels_valid) trimws(gsub("\n", " ", FACTOR_THEMES[[fa]])) else fa,
+        source_block    = NA_character_,
+        need_direction  = ifelse(z_vals[[fa]] > 0, "Above average", "Below average"),
+        z_score         = round(z_vals[[fa]], 3),
+        variable        = vars,
+        item_label      = var_labels,
+        loading         = round(fa_loadings_mat[vars, match(fa, num_cols)], 3),
+        factor_alpha    = unname(factor_alpha_lookup[fa]),
+        factor_reliable = unname(factor_reliable_lookup[fa])
+      )
+    })
+  })
+  # `%in%` treats NA safely here (NA %in% FALSE is FALSE, not NA), so this
+  # only counts rows genuinely flagged unreliable, not missing-reliability rows.
+  n_unreliable_rows <- sum(segment_defining_vars$factor_reliable %in% FALSE)
+  cat("Variable-level segment mapping: ", nrow(segment_defining_vars),
+      "(segment x defining-factor x raw-variable) rows across",
+      length(unique(segment_defining_vars$segment)), "segments (",
+      n_unreliable_rows, "rows belong to a factor flagged unreliable, factor_reliable = FALSE ).\n")
+} else if (hierarchical_defining_vars_valid) {
+  # ------------------------------------------------------------------------
+  # HIERARCHICAL VARIANT (02d): reconciles Stage 1's FOUR separate loadings
+  # matrices (45-item pool's 5 FA factors + F1's + F3's + ProviderPerception's
+  # own within-block factors) via `reduction_obj$score_item_map` -- built in
+  # 02d_Reduction_Stage_Hierarchical.Rmd's "score-traceability" chunk,
+  # exactly so this mapping would not have to stay permanently inert for
+  # this variant (see that chunk's header for how it was built). Each row
+  # here is one (segment x defining-score x raw-variable) combination,
+  # carrying that score's Stage 1 reliability verdict (factor_alpha/
+  # factor_reliable) AND which of the four Stage 1 blocks it came from
+  # (source_block) -- so a reader can immediately see, e.g., that a
+  # segment's F3_Factor1 defining variable rests on an alpha = 0.263,
+  # NOT-reliable factor, not just that F3r3/F3r13 happen to be listed.
+  # ------------------------------------------------------------------------
+  segment_defining_vars <- purrr::map_dfr(seq_len(nrow(rec_profile)), function(i) {
+    seg    <- as.character(rec_profile$segment[i])
+    z_vals <- unlist(rec_profile[i, num_cols])
+    defining_scores <- num_cols[abs(z_vals) >= DEFINING_NEED_Z]
+    purrr::map_dfr(defining_scores, function(sc) {
+      rows <- reduction_obj$score_item_map[reduction_obj$score_item_map$score_col == sc, ]
+      if (nrow(rows) == 0) return(NULL)
+      tibble::tibble(
+        segment         = seg,
+        segment_persona = segment_label_lookup(seg),
+        factor          = sc,
+        factor_theme    = FACTOR_THEMES[[sc]],  # auto-derived label (Section 13b), self-updating
+        source_block    = rows$source_block,
+        need_direction  = ifelse(z_vals[[sc]] > 0, "Above average", "Below average"),
+        z_score         = round(z_vals[[sc]], 3),
+        variable        = rows$variable,
+        item_label      = rows$item_label,
+        loading         = rows$loading,
+        factor_alpha    = rows$cronbach_alpha,
+        factor_reliable = rows$reliable
+      )
+    })
+  })
+  n_unreliable_rows <- sum(segment_defining_vars$factor_reliable %in% FALSE)
+  cat("Variable-level segment mapping (hierarchical, via score_item_map): ", nrow(segment_defining_vars),
+      "(segment x defining-score x raw-variable) rows across",
+      length(unique(segment_defining_vars$segment)), "segments (",
+      n_unreliable_rows, "rows come from a score flagged unreliable, factor_reliable = FALSE -- see",
+      "'Score Reliability Summary' and Section 13d's ablation check for how much this actually",
+      "matters to the recommended segmentation).\n")
+} else {
+  cat("NOTE: variable-level segment mapping skipped -- neither the FA-specific path (SCORE_SET =",
+      SCORE_SET, ") nor the hierarchical path (score_item_map/score_reliability present?",
+      all(c("score_item_map", "score_reliability") %in% names(reduction_obj)),
+      ") is valid for this run. Re-derive after re-knitting the Reduction Stage if this is unexpected.\n")
+  segment_defining_vars <- tibble::tibble(
+    segment = character(), segment_persona = character(), factor = character(),
+    factor_theme = character(), source_block = character(), need_direction = character(),
+    z_score = double(), factor_alpha = double(), factor_reliable = logical(),
+    variable = character(), item_label = character(), loading = double()
+  )
+}
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 13d. ROBUSTNESS CHECK: SENSITIVITY OF THE RECOMMENDED SOLUTION TO
+#      FLAGGED-UNRELIABLE SCORE INPUTS (ablation test)
+#      Two of the eight combined scores (F3_Factor1, ProviderPerception_
+#      Factor1 in the current run) failed the Stage 1 ALPHA_MIN reliability
+#      bar (see 'Score Reliability Summary'). Rather than silently including
+#      them and hoping they don't distort the recommended segmentation, or
+#      silently dropping them and losing real item coverage, this section
+#      does the empirical check directly: re-run the SAME recommended
+#      method at the SAME k on a "core-only" subset that excludes every
+#      flagged-unreliable score, and report how much the resulting
+#      segmentation agrees with the main recommendation (Adjusted Rand
+#      Index). This is the direct evidence for Browne's "are rival
+#      explanations ruled out?" question applied to this pipeline's own
+#      weakest link -- not an opinion about whether F3/ProviderPerception
+#      "should" matter, a measurement of whether they DO.
+# ------------------------------------------------------------------------
+unreliable_scores <- if ("score_reliability" %in% names(reduction_obj)) {
+  reduction_obj$score_reliability$score_col[reduction_obj$score_reliability$reliable %in% FALSE]
+} else {
+  character(0)
+}
+core_cols <- setdiff(num_cols, unreliable_scores)
+
+cat("Score(s) flagged NOT reliable in Stage 1:",
+    if (length(unreliable_scores) > 0) paste(unreliable_scores, collapse = ", ") else "(none)", "\n")
+
+run_solution_on_subset <- function(cols, method, k) {
+  scaled_subset <- continuous_scaled[, cols, drop = FALSE]
+  if (method == "GMM/LPA") {
+    fit <- mclust::Mclust(scaled_subset, G = k)
+    fit$classification
+  } else {
+    hc_subset <- hclust(dist(scaled_subset, method = "euclidean"), method = HIER_METHOD)
+    wc <- cutree(hc_subset, k = k)
+    if (method == "Ward's hierarchical") {
+      wc
+    } else {
+      wcent <- t(sapply(sort(unique(wc)), function(cl) colMeans(scaled_subset[wc == cl, , drop = FALSE])))
+      kmeans(scaled_subset, centers = wcent, iter.max = 100)$cluster
+    }
+  }
+}
+
+if (length(unreliable_scores) == 0) {
+  cat("No score column was flagged unreliable this run -- ablation check not applicable.\n")
+  ablation_ari <- NA_real_
+} else if (length(core_cols) < 2) {
+  cat("WARNING: fewer than 2 score columns would remain after dropping the flagged-unreliable",
+      "score(s) -- ablation check skipped (not enough dimensions to cluster on).\n")
+  ablation_ari <- NA_real_
+} else {
+  cat("Re-running the recommended", REC_METHOD, "k =", REC_K, "solution on the remaining",
+      length(core_cols), "score(s) only:", paste(core_cols, collapse = ", "), "\n")
+  set.seed(1526)
+  core_labels <- run_solution_on_subset(core_cols, REC_METHOD, REC_K)
+  ablation_ari <- mclust::adjustedRandIndex(rec_labels_df$segment, core_labels)
+  core_size_pct <- round(table(core_labels) / length(core_labels) * 100, 1)
+
+  cat("\nAdjusted Rand Index, full", length(num_cols), "-score recommended solution vs core-only (",
+      length(core_cols), "-score) solution:", round(ablation_ari, 3), "\n")
+  cat("Core-only segment sizes (%):\n"); print(core_size_pct)
+  cat("Full-solution segment sizes (%) for comparison:\n"); print(rec_size$pct)
+
+  if (ablation_ari >= 0.7) {
+    cat("\nINTERPRETATION: high agreement -- the recommended segmentation is NOT materially",
+        "dependent on the flagged-unreliable score(s); dropping them would not meaningfully",
+        "change segment membership. The 80-item coverage these scores provide can be reported",
+        "as additive, not load-bearing.\n")
+  } else if (ablation_ari >= 0.4) {
+    cat("\nINTERPRETATION: moderate agreement -- the flagged-unreliable score(s) have a real,",
+        "partial influence on where segment boundaries fall. Report this ARI alongside the main",
+        "result and treat the recommended solution's exact boundaries as somewhat sensitive to",
+        "these scores' inclusion, even though the recommended method/k itself is unaffected.\n")
+  } else {
+    cat("\nINTERPRETATION: low agreement -- the recommended segmentation is materially dependent",
+        "on the flagged-unreliable score(s). This is an important limitation to disclose:",
+        "at least part of the segment structure is being driven by input(s) that failed the",
+        "Stage 1 reliability bar, not just augmented by them.\n")
+  }
+}
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 14. CUSTOMER-TO-SEGMENT ASSIGNMENT RULES
+#     ("Create clear rules for assigning customers to segments" -- WBS
+#     Workstream 2 brief). A CART decision tree predicts the RECOMMENDED
+#     segmentation's labels from the same factor scores used to build it,
+#     producing simple, auditable if/then rules a client account team could
+#     apply to a customer who was not in this survey sample.
+# ------------------------------------------------------------------------
+rule_data <- continuous_input %>%
+  select(uuid, all_of(num_cols)) %>%
+  inner_join(rec_labels_df, by = "uuid") %>%
+  mutate(segment = as.factor(segment))
+
+set.seed(1526)
+train_idx  <- sample(seq_len(nrow(rule_data)), size = round(0.75 * nrow(rule_data)))
+train_data <- rule_data[train_idx, ]
+test_data  <- rule_data[-train_idx, ]
+
+## cp is tuned by 10-fold cross-validation + the one-standard-error rule
+## (Breiman et al., 1984) instead of being left at rpart's untuned 0.01
+## default. Grow a deliberately permissive tree (cp near zero) so the
+## cross-validated complexity path is fully visible, then prune back to
+## the smallest tree within one standard error of the minimum
+## cross-validated error. minbucket stays a fixed, data-proportional
+## floor (2% of the training sample) rather than something to tune, since
+## it exists to keep leaf-level rules legible for a client account team, not
+## to optimise predictive fit.
+full_tree <- rpart::rpart(
+  segment ~ ., data = train_data %>% select(-uuid),
+  method = "class",
+  control = rpart::rpart.control(cp = 0.0001, minbucket = round(0.02 * nrow(train_data)), xval = 10)
+)
+
+cp_table        <- full_tree$cptable
+min_xerror_row  <- which.min(cp_table[, "xerror"])
+se_threshold    <- cp_table[min_xerror_row, "xerror"] + cp_table[min_xerror_row, "xstd"]
+selected_row    <- min(which(cp_table[, "xerror"] <= se_threshold))
+selected_cp     <- cp_table[selected_row, "CP"]
+
+assignment_tree <- rpart::prune(full_tree, cp = selected_cp)
+
+cat("CART complexity parameter selected via 10-fold CV + 1-SE rule: cp =",
+    round(selected_cp, 4),
+    "(vs. rpart's untuned default cp = 0.01; cross-validated error table below)\n")
+print(cp_table)
+
+## FIGURE: assignment-rule decision tree.
+rpart.plot::rpart.plot(assignment_tree, type = 2, extra = 104, fallen.leaves = TRUE,
+                        main = "Customer-to-Segment Assignment Rules")
+dev.copy(png, file.path(output_dir, "segment_assignment_tree.png"), width = 1400, height = 900)
+invisible(dev.off())
+
+assignment_rules <- rpart.plot::rpart.rules(assignment_tree, style = "tall", cover = TRUE)
+cat("Plain-English customer-to-segment assignment rules:\n")
+print(assignment_rules)
+
+pred_test <- predict(assignment_tree, newdata = test_data, type = "class")
+tree_accuracy <- mean(pred_test == test_data$segment)
+tree_kappa <- {
+  tab <- table(pred_test, test_data$segment)
+  po  <- sum(diag(tab)) / sum(tab)
+  pe  <- sum(rowSums(tab) * colSums(tab)) / sum(tab)^2
+  (po - pe) / (1 - pe)
+}
+cat("\nHeld-out assignment-rule accuracy:", round(tree_accuracy, 3),
+    "| Cohen's kappa:", round(tree_kappa, 3),
+    "\n(kappa > 0.6 is conventionally 'substantial' agreement -- below that,",
+    "treat the rules as indicative, not authoritative)\n")
+
+## FIGURE: held-out confusion matrix.
+confmat_df <- as.data.frame(table(predicted = pred_test, actual = test_data$segment))
+p_confmat <- ggplot2::ggplot(confmat_df, ggplot2::aes(x = actual, y = predicted, fill = Freq)) +
+  ggplot2::geom_tile() +
+  ggplot2::geom_text(ggplot2::aes(label = Freq)) +
+  ggplot2::scale_fill_gradient(low = "white", high = "seagreen4") +
+  ggplot2::labs(title = "Assignment-rule confusion matrix (held-out 25% sample)",
+                x = "Actual segment", y = "Predicted segment", fill = "N") +
+  ggplot2::theme_minimal()
+print(p_confmat)
+ggplot2::ggsave(file.path(output_dir, "assignment_confusion_matrix.png"), p_confmat, width = 7, height = 6)
+```
+
+TABLE: plain-English customer-to-segment assignment rules (CART; held-out
+accuracy/kappa reported above).
+
+```{r, echo = FALSE, results = "asis"}
+cat("```\n")
+print(assignment_rules)
+cat("```\n")
+```
+
+```{r, results = "asis", echo = FALSE}
+# ------------------------------------------------------------------------
+# 15. RECOMMENDED SEGMENTATION MODEL -- RATIONALE & LIMITATIONS
+#     (rendered as narrative text in the knitted report; the numbers below
+#     are computed live from the sections above, but the bracketed
+#     [ANALYST: ...] prompts require the analyst's substantive judgement --
+#     segment names and commercial framing cannot be automated)
+# ------------------------------------------------------------------------
+cat("## Recommended Segmentation Model\n\n")
+cat(sprintf(
+  "Across the nine 4-6 segment candidates assessed in Section 12, the recommended needs-based segmentation is the **%s** solution with **%d segments** (composite quality score = %.3f; minimum segment size = %.1f%% of respondents; stability = %.3f; %s = %.3f).\n\n",
+  REC_METHOD, REC_K, best$composite_quality, best$min_segment_pct, best$stability_index,
+  if (REC_METHOD == "GMM/LPA") "entropy" else "mean eta-squared distinctiveness",
+  if (REC_METHOD == "GMM/LPA") best$entropy else best$distinctiveness_eta_sq
+))
+
+cat("### Segment sizes\n\n")
+print(knitr::kable(rec_size, col.names = c("Segment", "N", "% of sample")))
+cat("\n\n")
+
+cat("### Rationale\n\n")
+cat(sprintf(
+  "This solution was selected because it had the highest composite quality score among 4-6 segment candidates with no segment below the %d%% minimum-viable-size threshold, balancing size adequacy, distinctiveness/separation, stability and interpretability (see 'Quality Assessment' table). The held-out customer-to-segment assignment rules (Section 14) achieve %.1f%% accuracy (Cohen's kappa = %.2f) on a 25%% held-out sample, indicating the segmentation can be operationalised with a simple decision tree rather than requiring every future customer to be re-clustered from scratch.\n\n",
+  MIN_VIABLE_SEGMENT_PCT, tree_accuracy * 100, tree_kappa
+))
+cat("### Segment personas\n\n")
+# ROBUSTNESS (added on code review): this block previously had an
+# `if (segment_labels_valid) {...}` branch containing a hard-coded
+# persona_desc vector written for an OLDER GMM/LPA k=4 solution from a prior
+# version of this script. segment_labels_valid is hardcoded FALSE for this
+# hierarchical variant (Section 13b), so that branch could never execute --
+# but it sat in the file describing a solution that does not match this
+# script's actual recommendation (K-means k=4 in the current run, not
+# GMM/LPA k=4), which is a latent trap for a future maintainer who flips
+# segment_labels_valid without checking whether the persona text still
+# applies. Removed rather than left dead: if/when WS1-needs-specific
+# personas are deliberately written for a CURRENT recommended solution, add
+# them behind a fresh, explicitly-named guard (not this one) rather than
+# resurrecting this block.
+# REPLACED (2026-08-10, critical-analysis pass): the block above only
+# ever removed the OLD stale persona text (see comment history above) and
+# left a manual [ANALYST: ...] prompt in its place -- meaning no persona
+# text at all existed for the current recommended solution. This version
+# keeps the genuinely-judgement-requiring parts authored (persona names in
+# SEGMENT_THEMES above; the one interpretive sentence per segment below),
+# but grounds every FACTUAL claim -- which two need themes define each
+# segment, and each segment's firm-size profile -- in objects already
+# computed live earlier in this script (rec_profile/FACTOR_THEMES from
+# Section 13b, firmo_size_summary from Section 13c), so those numbers
+# self-update on re-knit even if the authored sentences eventually need a
+# fresh look. Guarded by segment_labels_valid (Section 13b) exactly like
+# the rest of the persona-labelling logic -- if a future re-knit changes
+# the recommended solution, this falls back to a generic prompt instead of
+# silently mislabelling a different result.
+if (segment_labels_valid) {
+  full_item_label <- function(sc) {
+    rows <- reduction_obj$score_item_map[reduction_obj$score_item_map$score_col == sc, ]
+    if (nrow(rows) == 0) return(sc)
+    rows$item_label[which.max(abs(rows$loading))]
+  }
+  # BUGFIX (2026-08-10, caught on visual QA of the first re-knit after this
+  # feature was added): ranking across ALL num_cols let F3_Factor1
+  # (alpha=0.263, essentially noise) and ProviderPerception_Factor1
+  # (alpha=0.621, below the Nunnally floor) surface as a segment's
+  # top-ranked "defining need" -- not because that segment has a genuinely
+  # elevated need there, but because a near-zero value on an unreliable
+  # factor can still rank highest when every reliable factor is deeply
+  # negative for that segment (this happened for 3 of 4 segments on the
+  # first re-knit, incl. F3_Factor1 ranking #1 for one segment). Restrict
+  # the defining-need ranking to the reliable factors only
+  # (reduction_obj$score_reliability), same reliability bar already used
+  # everywhere else in this script (ablation check, Limitations text) --
+  # falls back to the full set only if fewer than 4 factors are reliable
+  # (not the case here: 6 of 8 are), so ranking never silently breaks.
+  reliable_cols <- reduction_obj$score_reliability$score_col[reduction_obj$score_reliability$reliable]
+  rank_cols <- if (length(reliable_cols) >= 4) reliable_cols else num_cols
+  if (length(reliable_cols) < 4) {
+    cat("NOTE: fewer than 4 reliable scores available (", length(reliable_cols),
+        ") -- defining-need ranking below falls back to all", length(num_cols),
+        "scores, including any flagged unreliable.\n")
+  }
+  seg_defining <- purrr::map_dfr(rec_profile$segment, function(sg) {
+    zvec <- unlist(rec_profile[rec_profile$segment == sg, rank_cols])
+    top2 <- names(sort(zvec, decreasing = TRUE))[1:2]
+    bot2 <- names(sort(zvec, decreasing = FALSE))[1:2]
+    tibble::tibble(
+      segment = sg,
+      top_needs = paste(sapply(top2, full_item_label), collapse = "; "),
+      bottom_needs = paste(sapply(bot2, full_item_label), collapse = "; ")
+    )
+  })
+  seg_persona_tbl <- rec_size %>%
+    mutate(segment = as.character(segment)) %>%
+    left_join(firmo_size_summary %>% mutate(segment = as.character(segment)),
+              by = "segment") %>%
+    left_join(seg_defining, by = "segment")
+
+  # Authored 2026-08-10, grounded in the live figures joined above --
+  # re-check against fresh numbers if this pipeline is re-knitted with
+  # materially different segment centroids, sizes, or firm-size medians.
+  persona_notes <- c(
+    "1" = "The largest segment and the largest accounts by headcount, combining broad, high-intensity needs across strategic/future-readiness themes and wide service-quality expectations with a below-average need for a close, partner-style provider relationship -- consistent with a self-directed buyer that values breadth and capability over hand-holding. This segment also scores highest of the four on well-known-provider/brand-trust perception (ProviderPerception_Factor1), but that score is flagged below-reliability-floor (alpha=0.621) in Stage 1, so it is noted here as a secondary, lower-confidence observation rather than a headline defining need.",
+    "2" = "Small-to-mid accounts anchored on core network reliability and value for money, with comparatively little appetite for emerging/future technology -- a pragmatic, operationally-focused segment rather than an early-adopter one.",
+    "3" = "The smallest segment by both headcount and need intensity, scoring below average on every defining need dimension including relationship/partnership need (C5c-based NeedFA3 -- corrected 2026-08-22, previously reverse-coded and shown here as a standout strength; see 02c Section 3.2) -- consistent with a genuinely low-touch, low-complexity micro-business/sole-trader profile, not one seeking a close provider relationship. Workstream 3 messaging for this segment should lead with simplicity and low overhead rather than relationship depth.",
+    "4" = "Large accounts by headcount but with below-average expectations on core service quality and reliability relative to their size, and this segment's firmographic mix skews most toward public-sector organisations of the four -- worth checking in Workstream 3 whether this reflects public-sector procurement dynamics rather than genuinely lower need."
+  )
+  for (sg in seg_persona_tbl$segment) {
+    row <- seg_persona_tbl[seg_persona_tbl$segment == sg, ]
+    cat(sprintf(
+      "**Segment %s -- %s** (%s%% of respondents, n = %s; median %s employees, %s sites): defining needs skew highest on *%s* and lowest on *%s*. %s\n\n",
+      sg, SEGMENT_THEMES[[sg]], row$pct, row$n, row$median_employees, row$median_sites,
+      row$top_needs, row$bottom_needs, persona_notes[[sg]]
+    ))
+  }
+  cat("*Persona names and the interpretive sentence per segment above are analyst-authored (2026-08-10) based on the live segment profile, defining-need ranking and firmographic summary computed in this run; the defining-needs and firm-size figures themselves are computed live and will self-update on re-knit, but re-verify the authored sentences if the pipeline produces a materially different recommended solution.*\n\n")
+} else {
+  cat(sprintf(
+    "[ANALYST: name each segment and add one/two sentences of commercial framing per segment here, drawing on 'Segment Profile' (Section 13 output) and the firmographic profiling in Section 8 -- e.g. which segments skew toward larger accounts, particular sectors, or specific need factors. The existing SEGMENT_THEMES/persona notes (Section 13b/15) were written for K-means (confirmatory) k = 4 and do not match the current recommended solution (%s, k = %d) -- re-derive them before reporting.]\n\n",
+    REC_METHOD, REC_K
+  ))
+}
+
+cat("### Limitations\n\n")
+cat("- The segmentation is derived from a single cross-sectional survey wave; needs are self-reported and may not capture actual purchasing behaviour, and cannot detect need drift since fieldwork.\n")
+# ROBUSTNESS (added 2026-08-10, critical-analysis pass): the trailing
+# "[ANALYST: state the actual KMO/retained-k here...]" bracket was a
+# leftover template prompt -- the pipeline HAS been knitted and the real
+# number is already sitting in `reduction_obj` (Section 1), it just wasn't
+# plugged in. Fixed as a live sprintf() reference to
+# `reduction_obj$combined_kmo`/`length(num_cols)` rather than a hard-coded
+# number, so this sentence self-updates on any future re-knit instead of
+# needing the same manual fill-in again.
+cat(sprintf(
+  "- The clustering base is the combined output of a two-stage hierarchical reduction (02d_Reduction_Stage_Hierarchical.Rmd): 02c's 5 reliable FA factors from the 45-item WS1 pool, plus F1's and F3's own within-block factors, computed independently and combined without a further pooled EFA step. Unlike 02/02c, this pool represents information from all 80 raw items, not just 45 or 50 -- but it has NOT been tested for whether the block-level factor scores themselves combine into fewer, more parsimonious dimensions. Stage 2's own KMO on the %d combined scores is %.3f (%s the %.2f Kaiser floor), which answers whether these block-level summaries cohere, not whether the raw items cohere -- it is NOT numerically comparable, on a like-for-like basis, to either the 80-item flat pipeline's KMO=0.153 or the 45-item WS1 pool's KMO=0.973, since it is computed on a much smaller, already-reduced set of continuous factor scores rather than raw mixed-type items. Re-running the Reduction Stage with a different retained-factor count changes every downstream clustering input.\n",
+  length(num_cols), reduction_obj$combined_kmo,
+  if (reduction_obj$combined_kmo >= KMO_MIN) "clears" else "fails",
+  KMO_MIN
+))
+cat("- Distinctiveness/separation is measured differently for the distance-based methods (eta-squared) than for GMM/LPA (posterior entropy). Section 12 normalises each family against its own candidates before combining into the composite score, so a candidate's separation_score reflects its rank relative to same-type candidates only -- it is still a transparent shortlisting heuristic, not a formal statistical equivalence between eta-squared and entropy.\n")
+cat(sprintf("- Bootstrap stability estimates use %d (Ward's/K-means) and %d (GMM/LPA) bootstrap replicates -- adequate for shortlisting, but the analyst should re-run with higher replicate counts (e.g. 200+ for distance-based, 100+ for GMM/LPA) to confirm the final reported stability figures before submission.\n", STABILITY_B_DIST, STABILITY_B_GMM))
+cat("- The customer-to-segment assignment tree is trained and tested on the same survey sample used to build the segmentation; its accuracy on genuinely new, unsurveyed client customers has not been externally validated and should be treated as an upper bound.\n")
+cat("- The needs list clustered on here is inherited entirely from the Reduction Stage's item pool, correlation-matrix smoothing, and interpretability-screened factor-count search; revisiting those choices requires re-running this entire Workstream 2 pipeline, since the retained-factor scores drive every downstream input matrix.\n")
+# ROBUSTNESS (added on code review): previously left as a manual
+# [ANALYST: ...] to-do asking the analyst to re-check cross-method ARI
+# specifically at the recommended k. Section 11 already generated Ward's/
+# K-means/GMM-LPA candidates at every shortlisted k (including REC_K), so
+# this is computed directly here instead of left for manual re-derivation.
+rec_k_cand_dist <- candidate_dist[[paste0("k", REC_K)]]
+rec_k_cand_gmm  <- candidate_gmm[[paste0("k", REC_K)]]
+ari_at_rec_k <- tibble::tibble(
+  comparison = c("Ward's vs K-means (both at recommended k)",
+                 "Ward's vs GMM/LPA (both at recommended k)",
+                 "K-means vs GMM/LPA (both at recommended k)"),
+  adjusted_rand_index = c(
+    mclust::adjustedRandIndex(rec_k_cand_dist$ward, rec_k_cand_dist$kmeans),
+    mclust::adjustedRandIndex(rec_k_cand_dist$ward, rec_k_cand_gmm$classification),
+    mclust::adjustedRandIndex(rec_k_cand_dist$kmeans, rec_k_cand_gmm$classification)
+  )
+)
+cat(sprintf(
+  "- Cross-method triangulation (Section 7) reported an Adjusted Rand Index of Ward's-vs-GMM/LPA = %.3f and K-means-vs-GMM/LPA = %.3f on each method's own UNCONSTRAINED solution (Sections 4-6, k = %d for Ward's/K-means). Re-checked directly at the RECOMMENDED %d-segment level (all three methods forced to k = %d): Ward's-vs-K-means ARI = %.3f, Ward's-vs-GMM/LPA ARI = %.3f, K-means-vs-GMM/LPA ARI = %.3f. %s\n",
+  ari_table$adjusted_rand_index[ari_table$comparison == "Ward's vs GMM/LPA"],
+  ari_table$adjusted_rand_index[ari_table$comparison == "K-means (confirmatory) vs GMM/LPA"],
+  k_hier, REC_K, REC_K,
+  ari_at_rec_k$adjusted_rand_index[1], ari_at_rec_k$adjusted_rand_index[2], ari_at_rec_k$adjusted_rand_index[3],
+  if (min(ari_at_rec_k$adjusted_rand_index) < 0.3) {
+    "The methods diverge more once forced to the same k than the unconstrained comparison alone suggests -- this divergence should be discussed as a genuine methodological finding (different assumptions surfacing different structure), not smoothed over."
+  } else {
+    "Agreement at the recommended k is broadly consistent with the unconstrained comparison above."
+  }
+))
+if (length(unreliable_scores) == 0) {
+  cat("- No score input was flagged unreliable in Stage 1 this run, so the ablation/sensitivity check in Section 13d found no candidate for removal.\n")
+} else if (is.na(ablation_ari)) {
+  cat(sprintf("- %d score(s) failed the Stage 1 reliability bar (%s), but the ablation check in Section 13d could not be run (see that section's output for why) -- treat these scores' contribution to the recommended solution as unverified.\n",
+              length(unreliable_scores), paste(unreliable_scores, collapse = ", ")))
+} else {
+  cat(sprintf("- %s (Cronbach's alpha below the Nunnally 1978 floor in Stage 1) still contribute %d of the %d combined scores clustered on. Section 13d's ablation check re-ran the recommended %s k=%d solution without them: Adjusted Rand Index vs the main recommendation = %.3f (%s). This is the direct evidence for how much the recommended segmentation actually depends on these two flagged-unreliable scores, rather than an assumption either way.\n",
+              paste(unreliable_scores, collapse = " and "), length(unreliable_scores), length(num_cols),
+              REC_METHOD, REC_K, ablation_ari,
+              if (ablation_ari >= 0.7) "high agreement -- not materially dependent on them"
+              else if (ablation_ari >= 0.4) "moderate agreement -- a real but partial dependence"
+              else "low agreement -- materially dependent on them"))
+}
+
+# ADDED (2026-08-10, critical-analysis pass): Section 6's own unconstrained
+# GMM/LPA model-selection search (BIC minimised subject to entropy >=
+# ENTROPY_MIN, across k = 2-15, no business constraint) is a materially
+# different result from the k = 4-6 window Section 11 restricts the
+# cross-method comparison to -- the pipeline's own "next steps" note (top
+# of this script) explicitly warns that this kind of divergence "needs
+# discussing in the methodology chapter, not silently resolved," and it
+# was not previously discussed anywhere in this narrative. Fixed as a live
+# reference to `k_gmm`/`gmm_fit_table` (both already computed in Section 6,
+# in scope here) rather than a hard-coded "k=8", so this stays correct if
+# a future re-knit's BIC search lands on a different class count.
+gmm_bic_row <- gmm_fit_table[gmm_fit_table$nclass == k_gmm, ]
+cat(sprintf(
+  "- GMM/LPA's own unconstrained model-selection search (Section 6: BIC minimised subject to entropy >= %.2f, evaluated across k = %d-%d with no business constraint) selects **k = %d** as the statistically best-fitting model (BIC = %.0f, entropy = %.3f) -- not the k = 4-6 window used for the cross-method comparison and composite-quality shortlist in Sections 11-13 that produced the recommended %s k = %d solution. This range restriction (`SHORTLIST_K <- 4:6`) is a deliberate, documented design choice, not an oversight: the WBS Workstream 2 brief calls for a commercially actionable segment count, and unconstrained mixture-model fit statistics routinely favour more granular solutions than are practically usable for segment-based targeting (cf. Vermunt & Magidson, 2002, on the trade-off between statistical fit and interpretability/parsimony in latent-class work). The recommended solution should therefore be read as the best candidate *within* the business-relevant k = 4-6 range, not as the global statistical optimum across all class counts -- a distinction worth stating explicitly rather than leaving implicit.\n",
+  ENTROPY_MIN, min(gmm_fit_table$nclass), max(gmm_fit_table$nclass), k_gmm,
+  gmm_bic_row$BIC, gmm_bic_row$entropy, REC_METHOD, REC_K
+))
+```
+
+```{r}
+# ------------------------------------------------------------------------
+# 16. SAVE FINAL RECOMMENDATION OUTPUTS
+#     ("Needs-based customer segments that are distinct and useable" --
+#     WBS Workstream 2 expected output)
+# ------------------------------------------------------------------------
+score_reliability_export <- if ("score_reliability" %in% names(reduction_obj)) {
+  reduction_obj$score_reliability
+} else {
+  tibble::tibble(score_col = character(), source_block = character(),
+                 n_items = integer(), cronbach_alpha = double(), reliable = logical())
+}
+
+ablation_summary <- tibble::tibble(
+  metric = c("Unreliable score(s)", "Core-only score count", "Recommended method", "Recommended k",
+             "Ablation ARI (full vs core-only)", "Interpretation"),
+  value  = c(
+    if (length(unreliable_scores) > 0) paste(unreliable_scores, collapse = "; ") else "(none)",
+    length(core_cols), REC_METHOD, as.character(REC_K),
+    if (is.na(ablation_ari)) "NA (check not applicable/skipped)" else as.character(round(ablation_ari, 3)),
+    if (is.na(ablation_ari)) "n/a"
+    else if (ablation_ari >= 0.7) "High agreement -- not materially dependent on flagged-unreliable scores"
+    else if (ablation_ari >= 0.4) "Moderate agreement -- partial dependence on flagged-unreliable scores"
+    else "Low agreement -- materially dependent on flagged-unreliable scores"
+  )
+)
+
+writexl::write_xlsx(
+  list(
+    "Quality Assessment (9 candidates)" = quality_table,
+    "Recommended Solution"              = best,
+    "Segment Sizes"                     = rec_size_named,
+    "Segment Profile"                   = rec_profile_named,
+    "Segment Defining Variables"        = segment_defining_vars,
+    "Score Reliability Flags"           = score_reliability_export,
+    "Robustness Ablation Check"         = ablation_summary,
+    "Cross-Method ARI at Rec. k"        = ari_at_rec_k,
+    "All 9 Candidate Profiles"          = all_candidate_profiles,
+    "Customer Segment Assignments"      = rec_labels_df_named,
+    "Assignment Rule Performance"       = tibble(
+      metric = c("Accuracy", "Cohen's kappa"),
+      value  = c(round(tree_accuracy, 3), round(tree_kappa, 3))
+    )
+  ),
+  path = file.path(output_dir, "Workstream2d_Recommended_Segmentation_Hierarchical.xlsx")
+)
+capture.output(print(assignment_rules),
+                file = file.path(output_dir, "segment_assignment_rules.txt"))
+
+cat("\nFinal recommendation outputs written to:", normalizePath(output_dir), "\n")
+cat("-> Workstream2d_Recommended_Segmentation_Hierarchical.xlsx (quality table, recommended ",
+    "solution, NAMED segment sizes/profiles, segment-to-raw-variable mapping,",
+    "score reliability flags, robustness ablation check, customer assignments, rule performance)\n")
+cat("-> segment_assignment_tree.png / segment_assignment_rules.txt (assignment rules)\n")
+cat("-> needs_correlation_heatmap.png / Needs_Descriptive_Statistics.csv (Section 3)\n")
+```

@@ -1,0 +1,13 @@
+# Keep local data inputs and generated artefacts out of the public repository
+data/*
+!data/README.md
+*.csv
+*.xlsx
+*.xls
+*.db
+*.pkl
+*.joblib
+*.png
+*.pdf
+__pycache__/
+.ipynb_checkpoints/

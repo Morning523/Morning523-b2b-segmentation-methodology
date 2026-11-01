@@ -1,0 +1,1186 @@
+---
+title: "Workstream 2 - Needs-Based Segmentation: Reduction Stage (PCA & Factor Analysis on the WS1-Documented 46-Item Need Pool)"
+author: "Ayan Nazm"
+date: "2026-08-05"
+output: html_document
+---
+
+<!--
+PORTFOLIO VERSION NOTICE (added for public portfolio use):
+This notebook is adapted from a real dissertation/consultancy segmentation
+project for public demonstration of methodology only. The client
+organisation's name, the original survey instrument's question wording, the
+raw respondent data, and all real result figures (segment sizes, loadings,
+percentages, model fit statistics) have been removed or genericised. Running
+this script as-is will not reproduce any real findings -- see
+`../../../data/README.md`. Co-developed with a dissertation teammate; see
+this project's README for the authorship breakdown.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE)
+# NOTE: warning/message left visible deliberately for this pre-clustering
+# check -- a prior run with these suppressed hid the fact that psych::alpha()
+# was flagging unreversed items (that message happened to bypass suppression
+# since psych prints it directly rather than raising a warning() condition;
+# other calls like mixedCor()/KMO()/fa.parallel()/principal() raise proper
+# warnings that WOULD have been hidden). Once the output has been reviewed
+# and is clean, these can be switched back to FALSE for a tidier report.
+```
+
+```{r libraries}
+required_pkgs <- c("readxl", "dplyr", "tidyr", "purrr", "stringr", "tibble",
+                    "psych", "GPArotation", "ggplot2", "writexl", "forcats", "MASS")
+new_pkgs <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+if (length(new_pkgs) > 0) install.packages(new_pkgs, dependencies = TRUE)
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+dplyr_verbs <- c("select", "filter", "mutate", "arrange", "summarise",
+                 "summarize", "group_by", "count", "distinct", "slice",
+                 "rename", "bind_rows", "pull", "left_join")
+for (v in dplyr_verbs) assign(v, get(v, envir = asNamespace("dplyr")))
+rm(v, dplyr_verbs)
+```
+
+```{r configuration}
+# ------------------------------------------------------------------------
+# 1. CONFIGURATION
+# ------------------------------------------------------------------------
+data_path      <- "client_survey_data.xlsx"  # NOT INCLUDED in this repository -- see ../../../data/README.md
+value_map_path <- "value_label_map.csv"  # NOT INCLUDED -- original survey instrument wording is confidential
+output_dir     <- "workstream2c_outputs_ws1needs"
+dir.create(output_dir, showWarnings = FALSE)
+
+set.seed(1526)   # same seed as 02_Clustering.Rmd, for reproducibility across scripts
+
+LOADING_CUTOFF <- 0.40   # Albert (2003) / Dibb & Wensley (2002), as in Workstream 1
+ALPHA_MIN      <- 0.70   # Nunnally (1978)
+KMO_MIN        <- 0.60   # Kaiser (1974) "mediocre" floor for proceeding with EFA/PCA
+```
+
+```{r import}
+# ------------------------------------------------------------------------
+# 2. IMPORT
+# ------------------------------------------------------------------------
+raw <- read_excel(data_path, sheet = "A1", guess_max = 2000)
+cat("Loaded", nrow(raw), "respondents x", ncol(raw), "columns\n")
+
+df <- raw %>% filter(status == "Qualified")
+cat("Retained", nrow(df), "qualified respondents\n")
+
+value_map <- read.csv(value_map_path, stringsAsFactors = FALSE, encoding = "UTF-8")
+```
+
+```{r blocks}
+# ------------------------------------------------------------------------
+# 3. THE WS1-DOCUMENTED 46-ITEM NEED POOL
+#    Restricted to exactly the items covered by the two WS1 taxonomy
+#    documents ("the project's internal needs-discovery journey documents" and "WS1
+#    Needs -> Variable Mapping for WS2"), per explicit instruction not to
+#    introduce items those documents don't cover. Differences from
+#    02_Reduction_Stage.Rmd's 80-item pool:
+#      - C5c pair 6 ("providers understand the needs of modern businesses")
+#        is DROPPED -- WS1's own D1 classified it EXCLUDE (category
+#        perception, not a need); only 6 C5c items here (not 7).
+#      - F10's 4 buying-criteria items (well-known provider, easy-access
+#        channel, cheap prices, "a company we can trust") are DROPPED --
+#        WS1's D3 explicitly rules these out as buying criteria, not needs.
+#        F10 contributes 12 items here (not 16), 11 after the same
+#        F10r9/F10r10 sector-routing merge used in 02_Reduction_Stage.Rmd
+#        (still required for the same technical reason: these two items
+#        are asked of mutually-exclusive respondent subgroups, so their
+#        pairwise correlation is undefined without merging).
+#      - F1 and F3 (15 items each) are DROPPED ENTIRELY -- WS1's own D1
+#        classified both as EXCLUDE ("roadmap risk": reads like the client's own
+#        product roadmap, not bottom-up customer need), and neither
+#        document assigns them item-level need labels. See
+#        WS1_50Item_Needs_Register.xlsx's Methodology Note for the full
+#        reasoning behind this scope decision.
+#    Net pool: 6 (C5c) + 13 (F9a) + 12 (F10, pre-merge) + 15 (F5) = 46 items
+#    as documented; 45 once F10r9/F10r10 are merged for analysis below.
+# ------------------------------------------------------------------------
+block_C5c <- c(
+  C5c_1r1 = "Provider needs a deep understanding of our business",
+  C5c_1r2 = "We want a business partner, not just a supplier",
+  C5c_1r3 = "We need flexibility because our needs change all the time",
+  C5c_1r4 = "Our IT/telecoms needs are complex; we need providers that can support that",
+  C5c_2r5 = "Products/services need to be tailored to our needs",
+  C5c_2r7 = "We prefer all technology services through one provider"
+  # C5c_2r6 deliberately excluded -- WS1 D1: EXCLUDE (category perception,
+  # not a need)
+)
+
+block_F9a <- c(
+  F9ar1  = "Security features (encryption, remote wipe, firewall, email protection)",
+  F9ar2  = "Productivity tools (email, calendar, task managers, office suites)",
+  F9ar3  = "Remote collaboration (video, messaging, file-sharing)",
+  F9ar4  = "Mobile device management (centrally manage/secure devices)",
+  F9ar5  = "Compatibility with enterprise software (CRM/ERP/PM tools)",
+  F9ar6  = "BYOD support (secure/manageable personal devices)",
+  F9ar7  = "5G connectivity",
+  F9ar8  = "Environmental sustainability (recyclable handsets)",
+  F9ar9  = "Reliable network (uninterrupted, low latency)",
+  F9ar10 = "Value for money",
+  F9ar11 = "Flexible contracts (swap features monthly)",
+  F9ar12 = "Quality of customer service",
+  F9ar13 = "Network resolves issues quickly"
+)
+
+block_F10 <- c(
+  F10r1  = "Great customer service",
+  F10r4  = "High quality / top-end products and services",
+  F10r5  = "Online account management / self-service",
+  F10r6  = "Dedicated account manager / single point of contact",
+  F10r8  = "Provider at the forefront of new technology",
+  F10r9  = "Provider understands our industry sector",
+  F10r10 = "Provider understands the public sector",
+  F10r11 = "Strong security credentials",
+  F10r12 = "Wide range of business services",
+  F10r13 = "Tailored solutions",
+  F10r14 = "Helps improve workforce digital skills",
+  F10r16 = "Minimises financial loss by working quickly"
+  # F10r2 (well-known provider), F10r3 (easy-access channel), F10r7 (cheap
+  # prices), F10r15 (a company we can trust) deliberately excluded -- WS1
+  # D3: buying criteria, not needs
+)
+
+block_F5 <- c(
+  F5r1  = "Dealing with future, unknown cybersecurity threats",
+  F5r2  = "Meeting sustainability goals / being a sustainable business",
+  F5r3  = "Upskilling workforce in digital skills",
+  F5r4  = "Predictable, reliable network performance",
+  F5r5  = "Being an expert in data sovereignty",
+  F5r6  = "Digital transformation (digitise products/process, move to cloud)",
+  F5r7  = "Utilising AI (procurement, workplace/supply-chain efficiency)",
+  F5r8  = "Delivering hyper-personalisation for customers",
+  F5r9  = "Improving organisational agility to pivot",
+  F5r10 = "High visibility of customer data",
+  F5r11 = "Serving more complex customer needs / markets",
+  F5r12 = "Becoming a mobile-first business",
+  F5r13 = "Digitisation/simplification of the supply chain",
+  F5r14 = "Using technology to improve employee wellbeing/engagement",
+  F5r15 = "Secured software/devices enabling hybrid working"
+)
+
+# F1 and F3 (15 items each, current/planned adoption + future-usefulness
+# flag for the same technology list) are NOT part of this pool -- see the
+# Section 3 header for why.
+```
+
+```{r recoding-setup}
+# ------------------------------------------------------------------------
+# 3.1 RECODING HELPERS (identical logic to 01_needs_identification.R --
+#     see that script's Section 3 header for the full data-quirk rationale)
+# ------------------------------------------------------------------------
+recode_from_map <- function(data, vars, value_map) {
+  for (v in vars) {
+    lookup  <- value_map %>% filter(variable == v) %>%
+      select(label, code) %>% distinct()
+    map_vec <- setNames(lookup$code, lookup$label)
+    data[[v]] <- unname(map_vec[as.character(data[[v]])])
+  }
+  data
+}
+
+extract_leading_int <- function(x) {
+  as.numeric(stringr::str_extract(trimws(as.character(x)), "^\\d+"))
+}
+
+recode_checkbox <- function(x) {
+  ifelse(is.na(x), NA_real_,
+         ifelse(stringr::str_starts(trimws(as.character(x)), "NO TO:"), 0, 1))
+}
+
+# (a) Exact-label recode: F5 -----------------------------------------------
+exact_label_vars <- names(block_F5)
+df <- recode_from_map(df, exact_label_vars, value_map)
+
+# (b) Hybrid numeric/label recode: F9a, F10 -------------------------------
+df[names(block_F9a)] <- lapply(df[names(block_F9a)], extract_leading_int)
+df[names(block_F10)] <- lapply(df[names(block_F10)], extract_leading_int)
+
+# ROUTING FIX: F10r9/F10r10 sector split -> coalesce. Same technical
+# necessity as 02_Reduction_Stage.Rmd -- these two items are asked of
+# mutually-exclusive respondent subgroups (routed by S4), so their pairwise
+# correlation is undefined without merging; drops F10 from 12 to 11 items.
+df <- df %>% mutate(F10r9 = ifelse(is.na(F10r9), F10r10, F10r9))
+block_F10 <- block_F10[names(block_F10) != "F10r10"]
+block_F10["F10r9"] <- "Provider understands our sector (industry or public sector)"
+
+# (c) True numeric: C5c -- REVERSE-CODED, see Section 3.2 -------------------
+# C5c's raw 1-7 codes run the OPPOSITE direction to every other "SC per row"
+# scale in this survey (F8/F9a/F10 are explicitly documented in the
+# questionnaire script as 1=low/7=high; C5c has no such documented anchor,
+# and the un-reversed raw codes correlate the WRONG way against F5 -- see
+# Section 3.2). Reversed here (8 - x) so that, like every other block,
+# higher = stronger need/agreement.
+df[names(block_C5c)] <- lapply(df[names(block_C5c)], function(x) 8 - as.numeric(x))
+
+# NOTE: no binary-checkbox recode step here -- F3 is not part of this pool.
+```
+
+```{r polarity-harmonisation}
+# ------------------------------------------------------------------------
+# 3.2 POLARITY HARMONISATION
+#     A single combined reduction requires every item to point the same
+#     way ("higher score = stronger/more immediate business need") --
+#     standard practice before pooling reverse-worded or differently-scaled
+#     items into one model (DeVellis, 2016, "Scale Development", ch. 4).
+#     F9a/F10 already run 1(low importance) -> 7(high importance); no change
+#     needed. C5c does NOT -- its raw codes were found (2026-08) to run the
+#     opposite way to every other scale in this survey: cross-checked
+#     against F5 (whose direction is unambiguous, text-labelled) on three
+#     tight, near-tautological item pairs (e.g. "agility to pivot is an
+#     urgent priority" vs "we need flexibility, our needs change all the
+#     time") and all three came back negatively correlated under the raw
+#     coding, when a firm agreeing more with one should almost by definition
+#     agree more with the other. No literal scale-anchor documentation was
+#     available to confirm this directly (the questionnaire script states
+#     F8/F9a/F10's anchors explicitly but not C5c's) -- reversed here on the
+#     strength of that convergent indirect evidence; flagged as an inferred
+#     correction, not a confirmed one, in the methodology write-up.
+#     C5c is now reversed (8 - x, see chunk above) so it also runs
+#     1(low)->7(high). F5 needs re-basing as described below (F1 is not
+#     part of this pool -- see Section 3 header).
+#
+#  F5 (raw codes): 1 = Current priority (next 12 months)
+#                  2 = Shorter-term (1-3 years)
+#                  3 = Medium-term (5-10 years)
+#                  4 = Longer-term (10+ years)
+#                  5 = Not a priority
+#     This is a TIMING label, not a need-intensity scale -- exactly the
+#     construct the client asked to move away from as the segmentation basis.
+#     Re-based here to "need_intensity_F5" = 6 - raw_code, giving a 1-5
+#     scale where 5 = most immediate/urgent need and 1 = no need ("not a
+#     priority"), monotonic in urgency rather than a categorical timeline.
+# ------------------------------------------------------------------------
+rebase_need_intensity <- function(x) {
+  x <- ifelse(x %in% 1:5, 6 - x, NA_real_)
+  x
+}
+
+df[names(block_F5)] <- lapply(df[names(block_F5)], rebase_need_intensity)
+```
+
+```{r assemble-matrix}
+# ------------------------------------------------------------------------
+# 4. ASSEMBLE THE MASTER WS1-DOCUMENTED NEEDS MATRIX (45 ANALYSED)
+# ------------------------------------------------------------------------
+all_blocks <- c(block_C5c, block_F9a, block_F10, block_F5)
+stopifnot(length(all_blocks) == 45)   # guardrail: must be exactly 45 items
+                                       # (46 as documented, 45 after the
+                                       # F10r9/F10r10 merge above)
+
+needs_ws1_vars <- names(all_blocks)
+needs_ws1_raw  <- as.data.frame(df[, needs_ws1_vars])
+
+cat("Assembled raw-needs matrix:", nrow(needs_ws1_raw), "respondents x",
+    ncol(needs_ws1_raw), "items (target: 45)\n")
+
+na_rate <- sapply(needs_ws1_raw, function(x) mean(is.na(x)))
+cat("\nItem missingness range:", round(min(na_rate) * 100, 1), "% -",
+    round(max(na_rate) * 100, 1), "%\n")
+suspect <- na_rate[na_rate > 0.5]
+if (length(suspect) > 0) {
+  cat("WARNING: >50% NA on:\n"); print(round(suspect * 100, 1))
+}
+
+# Visual EDA: item-level missingness, worst 25 items, against the 50%
+# exclusion threshold used above -- a table of 45 numbers is hard to scan,
+# a sorted bar chart makes outlier items immediately visible.
+missingness_df <- tibble::tibble(
+  variable   = names(na_rate),
+  na_pct     = unname(na_rate) * 100,
+  item_label = unname(all_blocks[names(na_rate)])
+) %>% arrange(desc(na_pct)) %>% head(25)
+
+missingness_plot <- ggplot2::ggplot(missingness_df,
+      ggplot2::aes(x = reorder(variable, na_pct), y = na_pct)) +
+  ggplot2::geom_col(fill = "#2166AC") +
+  ggplot2::geom_hline(yintercept = 50, linetype = "dashed", color = "#B2182B") +
+  ggplot2::coord_flip() +
+  ggplot2::labs(title = "Item missingness -- 25 highest of 45 WS1-documented need items",
+                subtitle = "Dashed line = 50% exclusion threshold",
+                x = NULL, y = "% missing") +
+  ggplot2::theme_minimal(base_size = 10)
+print(missingness_plot)
+ggplot2::ggsave(file.path(output_dir, "reduction_item_missingness.png"),
+                 plot = missingness_plot, width = 8, height = 8, dpi = 300)
+
+# Variable-type index for mixedCor(): 7-pt blocks treated as continuous
+# (>=5 categories; Rhemtulla et al., 2012), re-based F5/F1 as polytomous
+# ordinal (5 categories), F3 as dichotomous.
+continuous_vars <- c(names(block_C5c), names(block_F9a), names(block_F10))
+polytomous_vars <- names(block_F5)
+dichotomous_vars <- character(0)   # F3 not part of this pool
+
+idx_c <- which(needs_ws1_vars %in% continuous_vars)
+idx_p <- which(needs_ws1_vars %in% polytomous_vars)
+idx_d <- which(needs_ws1_vars %in% dichotomous_vars)
+stopifnot(length(idx_c) == 30, length(idx_p) == 15, length(idx_d) == 0)
+```
+
+```{r mixed-correlations}
+# ------------------------------------------------------------------------
+# 5. MIXED-TYPE CORRELATION MATRIX + SUITABILITY DIAGNOSTICS
+#    (Holgado-Tello et al., 2010; Basto & Pereira, 2012 -- see Section 0.2)
+#    NOTE: polychoric/polyserial estimation across this 45-item pool is
+#    still computationally non-trivial (heavier than a plain Pearson
+#    matrix), though lighter than the 80-item pipeline's equivalent step.
+# ------------------------------------------------------------------------
+mixed_cor <- psych::mixedCor(data = needs_ws1_raw, c = idx_c, p = idx_p,
+                              d = if (length(idx_d) > 0) idx_d else NULL,
+                              use = "pairwise")
+needs_ws1_rho <- mixed_cor$rho
+n_obs_ws1 <- nrow(needs_ws1_raw)
+
+# --- Guardrail: mixedCor() can silently return NaN for individual item
+# pairs (sparse/empty response categories, near-zero-variance items) even
+# when the call itself raises no error. A single non-finite cell makes
+# psych::KMO() return NA for MSA/MSAi with NO error, which then crashes the
+# `if (kmo_res$MSA < KMO_MIN)` check below. Check for this BEFORE running
+# KMO/Bartlett, so a bad cell is diagnosed by item name rather than by a
+# downstream comparison error.
+bad_cells <- which(!is.finite(needs_ws1_rho), arr.ind = TRUE)
+if (nrow(bad_cells) > 0) {
+  bad_items <- sort(unique(rownames(needs_ws1_rho)[bad_cells[, 1]]))
+  cat("WARNING:", length(bad_items), "item(s) produced non-finite",
+      "correlation(s) in needs_ws1_rho -- inspect before proceeding:\n")
+  print(bad_items)
+  cat("\nVariance / response-table check for flagged items:\n")
+  print(sapply(needs_ws1_raw[bad_items], function(x) var(as.numeric(x), na.rm = TRUE)))
+  for (v in bad_items) {
+    cat("\nResponse table --", v, "--\n")
+    print(table(needs_ws1_raw[[v]], useNA = "ifany"))
+  }
+  stop("Resolve non-finite entries in needs_ws1_rho (drop/recode the item(s) ",
+       "listed above) before computing KMO/Bartlett. See printed diagnostics.")
+}
+
+# --- Guardrail 2: positive-definiteness. mixedCor() estimates each
+# pairwise polychoric/polyserial correlation independently (a two-step
+# approximation), which does NOT guarantee the resulting 45x45 matrix is a
+# valid positive semi-definite correlation matrix -- a well-documented risk
+# with mixed-type correlation matrices (Basto & Pereira, 2012). A non-PD
+# matrix can silently return NA for KMO/Bartlett/FA with NO error, even
+# when every individual cell above is finite -- exactly what happened in
+# the pilot run of this script (Overall KMO came back NA, no crash, no
+# flagged item). Check the eigenvalues directly and smooth to the nearest
+# PD correlation matrix if needed, the standard remedy for this failure
+# mode (Basto & Pereira, 2012; psych::cor.smooth()).
+eig_vals <- eigen(needs_ws1_rho, symmetric = TRUE, only.values = TRUE)$values
+n_negative_eig <- sum(eig_vals < -1e-8)
+cat("Correlation matrix eigenvalue check:", n_negative_eig,
+    "negative eigenvalue(s) of", length(eig_vals), "\n")
+if (n_negative_eig > 0) {
+  cat("WARNING: needs_ws1_rho is not positive semi-definite -- applying",
+      "psych::cor.smooth() to obtain the nearest valid correlation matrix",
+      "before computing KMO/Bartlett/parallel analysis/PCA/EFA.\n")
+  needs_ws1_rho <- psych::cor.smooth(needs_ws1_rho)
+  dimnames(needs_ws1_rho) <- list(needs_ws1_vars, needs_ws1_vars)  # cor.smooth() rebuilds
+                                                              # the matrix via eigen
+                                                              # decomposition; restore
+                                                              # item names explicitly
+                                                              # rather than assume they
+                                                              # survive the round-trip.
+}
+
+# Visual check on the mixed-type correlation matrix itself: with 45 items,
+# the printed matrix is unreadable, but a heatmap in the original block
+# order (C5c -> F9a -> F10 -> F5) should show visibly denser
+# colour within each block than between blocks -- a quick, visual version
+# of the "do the six question blocks cohere" check that the later PCA/EFA
+# loadings will make formal.
+tryCatch({
+  cor_long <- as.data.frame(needs_ws1_rho) %>%
+    tibble::rownames_to_column("var1") %>%
+    tidyr::pivot_longer(-var1, names_to = "var2", values_to = "rho") %>%
+    mutate(var1 = factor(var1, levels = needs_ws1_vars),
+           var2 = factor(var2, levels = rev(needs_ws1_vars)))
+
+  cor_heatmap <- ggplot2::ggplot(cor_long, ggplot2::aes(var1, var2, fill = rho)) +
+    ggplot2::geom_tile() +
+    ggplot2::scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                                   midpoint = 0, limits = c(-1, 1), name = "r") +
+    ggplot2::labs(title = "Mixed-type correlation matrix -- 45 WS1-documented need items",
+                  subtitle = "Pearson / polyserial / polychoric (psych::mixedCor); items in block order",
+                  x = NULL, y = NULL) +
+    ggplot2::theme_minimal(base_size = 5) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, vjust = 0.5),
+                   panel.grid = ggplot2::element_blank())
+  print(cor_heatmap)
+  ggplot2::ggsave(file.path(output_dir, "reduction_correlation_heatmap.png"),
+                   plot = cor_heatmap, width = 14, height = 12, dpi = 300)
+}, error = function(e) cat("Correlation heatmap skipped:", conditionMessage(e), "\n"))
+
+kmo_res  <- psych::KMO(needs_ws1_rho)
+bart_res <- psych::cortest.bartlett(needs_ws1_rho, n = n_obs_ws1)
+
+cat("Overall KMO =", round(kmo_res$MSA, 3),
+    "(floor for proceeding:", KMO_MIN, ", Kaiser 1974)\n")
+cat("Bartlett's test: chi-sq =", round(bart_res$chisq, 1),
+    ", df =", bart_res$df, ", p =", signif(bart_res$p.value, 3), "\n")
+
+if (is.na(kmo_res$MSA) || kmo_res$MSA < KMO_MIN) {
+  cat("WARNING: overall KMO could not be computed or is below", KMO_MIN,
+      "-- inspect item-level MSA before trusting the extracted structure.\n")
+}
+
+# Item-level MSA -- flag any item pulling the overall KMO down materially,
+# so a defensible item-drop decision can be made and documented if needed.
+item_msa <- sort(kmo_res$MSAi)
+cat("\nLowest item-level MSA (first 10):\n")
+print(round(head(item_msa, 10), 3))
+
+# All 45 items, sorted, against the Kaiser (1974) floor -- makes it
+# immediately visible whether a handful of weak items are dragging the
+# overall KMO down (candidates for a documented item-drop) or whether low
+# adequacy is spread broadly across the pool (a more structural concern).
+tryCatch({
+  msa_df <- tibble::tibble(
+    variable   = names(kmo_res$MSAi),
+    msa        = unname(kmo_res$MSAi),
+    item_label = unname(all_blocks[names(kmo_res$MSAi)])
+  ) %>% arrange(msa)
+
+  msa_plot <- ggplot2::ggplot(msa_df, ggplot2::aes(x = reorder(variable, msa), y = msa,
+                                                    fill = msa < KMO_MIN)) +
+    ggplot2::geom_col() +
+    ggplot2::geom_hline(yintercept = KMO_MIN, linetype = "dashed", color = "black") +
+    ggplot2::scale_fill_manual(values = c("TRUE" = "#B2182B", "FALSE" = "#2166AC"),
+                                guide = "none") +
+    ggplot2::coord_flip() +
+    ggplot2::labs(title = "Item-level Measure of Sampling Adequacy (KMO) -- all 45 items",
+                  subtitle = paste("Dashed line = Kaiser (1974) floor of", KMO_MIN,
+                                    "; red bars fall below it"),
+                  x = NULL, y = "MSA") +
+    ggplot2::theme_minimal(base_size = 5)
+  print(msa_plot)
+  ggplot2::ggsave(file.path(output_dir, "reduction_item_msa.png"),
+                   plot = msa_plot, width = 8, height = 16, dpi = 300)
+}, error = function(e) cat("Item-MSA plot skipped:", conditionMessage(e), "\n"))
+```
+
+```{r parallel-analysis}
+# ------------------------------------------------------------------------
+# 6. DIMENSIONALITY: PARALLEL ANALYSIS (Horn, 1965)
+#    Run once on the mixed correlation matrix and used to decide the
+#    number of components (PCA, Section 7) and factors (EFA, Section 8).
+# ------------------------------------------------------------------------
+pa <- psych::fa.parallel(needs_ws1_rho, n.obs = n_obs_ws1, fa = "both",
+                          n.iter = 100, plot = TRUE,
+                          main = "Parallel analysis -- 45 WS1-documented need items")
+ggplot2::ggsave(file.path(output_dir, "reduction_parallel_analysis.png"),
+                 width = 9, height = 6)
+
+n_comp_suggested <- pa$ncomp
+n_fact_suggested <- pa$nfact
+cat("Parallel analysis suggests", n_comp_suggested,
+    "component(s) (PCA) and", n_fact_suggested, "factor(s) (EFA)\n")
+
+# psych::fa.parallel's base-graphics plot (above) is functional but not
+# report-ready; a ggplot2 version of the same observed-vs-simulated
+# eigenvalue comparison is easier to read at a glance and matches the
+# styling of the other diagnostic plots in this script.
+tryCatch({
+  pa_df <- dplyr::bind_rows(
+    tibble::tibble(index = seq_along(pa$pc.values), eigenvalue = pa$pc.values,
+                    series = "PCA -- observed"),
+    tibble::tibble(index = seq_along(pa$pc.sim),    eigenvalue = pa$pc.sim,
+                    series = "PCA -- simulated (95th %ile)"),
+    tibble::tibble(index = seq_along(pa$fa.values), eigenvalue = pa$fa.values,
+                    series = "FA -- observed"),
+    tibble::tibble(index = seq_along(pa$fa.sim),    eigenvalue = pa$fa.sim,
+                    series = "FA -- simulated (95th %ile)")
+  )
+
+  pa_plot <- ggplot2::ggplot(pa_df, ggplot2::aes(x = index, y = eigenvalue,
+                                                  color = series, linetype = series)) +
+    ggplot2::geom_line(linewidth = 0.8) +
+    ggplot2::geom_point(size = 1.2) +
+    ggplot2::geom_hline(yintercept = 1, linetype = "dotted", color = "grey40") +
+    ggplot2::scale_color_manual(values = c("PCA -- observed" = "#2166AC",
+                                            "PCA -- simulated (95th %ile)" = "#92C5DE",
+                                            "FA -- observed" = "#B2182B",
+                                            "FA -- simulated (95th %ile)" = "#F4A582")) +
+    ggplot2::labs(title = "Parallel analysis -- 45 WS1-documented need items",
+                  subtitle = paste0("Retain components/factors while observed eigenvalue > simulated ",
+                                     "(suggests ", n_comp_suggested, " component(s), ",
+                                     n_fact_suggested, " factor(s))"),
+                  x = "Component / factor number", y = "Eigenvalue", color = NULL, linetype = NULL) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(legend.position = "bottom")
+  print(pa_plot)
+  ggplot2::ggsave(file.path(output_dir, "reduction_parallel_analysis_ggplot.png"),
+                   plot = pa_plot, width = 9, height = 6, dpi = 300)
+}, error = function(e) cat("ggplot parallel-analysis chart skipped:", conditionMessage(e), "\n"))
+```
+
+```{r pca}
+# ------------------------------------------------------------------------
+# 7. PRINCIPAL COMPONENT ANALYSIS
+#    PCA on the mixed correlation matrix (Jolliffe, 2002). Retained
+#    components are unrotated-variance-maximising linear composites of all
+#    45 items -- useful as a data-reduction baseline to compare against the
+#    common-factor (EFA) solution in Section 8.
+# ------------------------------------------------------------------------
+pca_res <- psych::principal(needs_ws1_rho, nfactors = n_comp_suggested,
+                             rotate = "varimax", n.obs = n_obs_ws1)
+print(pca_res$loadings, cutoff = LOADING_CUTOFF, sort = TRUE)
+
+pca_var_explained <- pca_res$Vaccounted
+cat("\nVariance accounted for by retained components:\n")
+print(round(pca_var_explained, 3))
+
+# Scree-style variance-explained chart: bars = per-component share, red
+# line = cumulative share -- the standard visual companion to the
+# printed Vaccounted table, and easier to defend a retention decision
+# against ("how much of the 45-item pool do these components actually
+# summarise?") than a matrix of numbers.
+tryCatch({
+  ve_mat <- as.matrix(pca_var_explained)
+  prop_row <- grep("^Proportion Var$", rownames(ve_mat), value = TRUE)[1]
+  cum_row  <- grep("^Cumulative Var$", rownames(ve_mat), value = TRUE)[1]
+  stopifnot(!is.na(prop_row), !is.na(cum_row))
+
+  pct_fmt <- function(x) paste0(round(x * 100), "%")
+  pca_scree_df <- tibble::tibble(
+    component  = factor(colnames(ve_mat), levels = colnames(ve_mat)),
+    proportion = ve_mat[prop_row, ],
+    cumulative = ve_mat[cum_row, ]
+  )
+
+  pca_scree_plot <- ggplot2::ggplot(pca_scree_df, ggplot2::aes(x = component)) +
+    ggplot2::geom_col(ggplot2::aes(y = proportion), fill = "#2166AC") +
+    ggplot2::geom_line(ggplot2::aes(y = cumulative, group = 1), color = "#B2182B", linewidth = 1) +
+    ggplot2::geom_point(ggplot2::aes(y = cumulative), color = "#B2182B", size = 2) +
+    ggplot2::scale_y_continuous(labels = pct_fmt, name = "Variance explained") +
+    ggplot2::labs(title = "PCA: variance explained by retained components",
+                  subtitle = "Bars = per-component share; red line = cumulative share", x = NULL) +
+    ggplot2::theme_minimal(base_size = 11)
+  print(pca_scree_plot)
+  ggplot2::ggsave(file.path(output_dir, "reduction_pca_variance_explained.png"),
+                   plot = pca_scree_plot, width = 8, height = 5, dpi = 300)
+}, error = function(e) cat("PCA variance-explained chart skipped:", conditionMessage(e), "\n"))
+
+# Respondent-level PCA scores via regression scoring on the mixed
+# correlation matrix (Grice, 2001) -- items z-scored first so scoring
+# weights (derived from the mixed rho) are applied on a common scale.
+#
+# IMPUTATION NOTE: mixedCor() above correctly used pairwise-complete
+# correlations, so the extracted PCA/EFA structure is unaffected by item
+# missingness. But `matrix %*% weights` scoring needs a COMPLETE data
+# matrix -- a single missing item silently turns EVERY output score for
+# that respondent into NA. Left unaddressed, this discarded the majority of
+# respondents in the pilot run of this script -- a severe, unintended
+# sample loss for the Clustering Stage that consumes these scores. Per-item
+# MEDIAN imputation (robust to the mixed 7-pt/5-pt/binary scales here) is
+# applied ONLY at this scoring step, on a copy of the data; it does not
+# alter needs_ws1_rho, the loadings, or any diagnostic computed above, all of
+# which remain estimated from the pairwise-complete raw data. A fuller
+# treatment (e.g. multiple imputation) is a reasonable extension to note as
+# a limitation if item missingness proves substantial.
+n_missing_cells <- sum(is.na(needs_ws1_raw))
+n_incomplete_resp <- sum(!complete.cases(needs_ws1_raw))
+cat("Median-imputing", n_missing_cells, "missing cell(s) across",
+    n_incomplete_resp, "of", nrow(needs_ws1_raw), "respondents for scoring",
+    "only (", round(100 * n_incomplete_resp / nrow(needs_ws1_raw), 1),
+    "% of respondents would otherwise receive entirely NA scores).\n")
+
+impute_item_median <- function(x) {
+  x[is.na(x)] <- stats::median(x, na.rm = TRUE)
+  x
+}
+needs_ws1_imputed <- as.data.frame(lapply(needs_ws1_raw, impute_item_median))
+
+needs_ws1_z <- scale(as.matrix(needs_ws1_imputed))
+
+# SCORING-STABILITY NOTE: cor.smooth() (Section 5) makes needs_ws1_rho a
+# valid PD matrix, but it can leave the matrix close to singular in a few
+# directions (the smoothing nudges tiny/negative eigenvalues up to a small
+# positive floor rather than removing them). `solve()` on a near-singular
+# matrix amplifies exactly those directions -- in the pilot run this
+# produced PCA scores that looked fine but FA scores in the hundreds of
+# millions once an oblique loading vector happened to align with the
+# unstable subspace. MASS::ginv() (Moore-Penrose pseudo-inverse) damps
+# near-zero eigenvalue directions instead of blowing them up, and is used
+# for both PCA and FA scoring weights below for consistency/robustness.
+pca_weights <- MASS::ginv(needs_ws1_rho) %*% unclass(pca_res$loadings)
+pca_scores <- needs_ws1_z %*% pca_weights
+colnames(pca_scores) <- paste0("PC", seq_len(ncol(pca_scores)))
+
+pca_score_range <- range(pca_scores)
+cat("PCA score range:", round(pca_score_range[1], 2), "to",
+    round(pca_score_range[2], 2), "\n")
+if (max(abs(pca_score_range)) > 20) {
+  cat("WARNING: PCA scores exceed a plausible range for standardised",
+      "composite scores (expected roughly -5 to +5) -- inspect needs_ws1_rho",
+      "conditioning before trusting these scores.\n")
+}
+
+pca_loadings_df <- as.data.frame(unclass(pca_res$loadings)) %>%
+  tibble::rownames_to_column("variable") %>%
+  mutate(item_label = unname(all_blocks[variable]))
+
+# Loadings heatmap: 45 items x retained components, cells below
+# LOADING_CUTOFF blanked out -- the visual equivalent of the sorted,
+# cutoff-filtered print(pca_res$loadings) table above, but scannable at a
+# glance for which items define which component.
+tryCatch({
+  pc_cols <- setdiff(names(pca_loadings_df), c("variable", "item_label"))
+  pca_load_long <- pca_loadings_df %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(pc_cols), names_to = "component", values_to = "loading") %>%
+    mutate(loading_display = ifelse(abs(loading) >= LOADING_CUTOFF, loading, NA_real_),
+           variable = factor(variable, levels = rev(needs_ws1_vars)),
+           component = factor(component, levels = pc_cols))
+
+  pca_loadings_heatmap <- ggplot2::ggplot(pca_load_long,
+        ggplot2::aes(x = component, y = variable, fill = loading_display)) +
+    ggplot2::geom_tile(color = "grey90") +
+    ggplot2::scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                                   midpoint = 0, na.value = "grey95",
+                                   limits = c(-1, 1), name = "Loading") +
+    ggplot2::labs(title = "PCA loadings heatmap",
+                  subtitle = paste0("Blank cells: |loading| < ", LOADING_CUTOFF, " cutoff"),
+                  x = NULL, y = NULL) +
+    ggplot2::theme_minimal(base_size = 5) +
+    ggplot2::theme(panel.grid = ggplot2::element_blank())
+  print(pca_loadings_heatmap)
+  ggplot2::ggsave(file.path(output_dir, "reduction_pca_loadings_heatmap.png"),
+                   plot = pca_loadings_heatmap, width = 8, height = 16, dpi = 300)
+}, error = function(e) cat("PCA loadings heatmap skipped:", conditionMessage(e), "\n"))
+```
+
+```{r efa}
+# ------------------------------------------------------------------------
+# 8. EXPLORATORY FACTOR ANALYSIS
+#    Minimum-residual extraction (robust default per Costello & Osborne,
+#    2005) with OBLIQUE (oblimin) rotation -- a deliberate divergence from
+#    Workstream 1's varimax choice: Workstream 1's blocks (C5c/F9a/F10)
+#    were each a single, conceptually narrow battery where near-orthogonal
+#    factors were plausible; this stage pools six different question
+#    blocks spanning security, connectivity, cost, sustainability, supplier
+#    trust, etc., where the resulting "need dimensions" are theoretically
+#    likely to correlate with one another (a business with high security
+#    needs plausibly also has high compliance/data-sovereignty needs).
+#    Oblique rotation is the recommended choice whenever correlated factors
+#    are plausible a priori (Costello & Osborne, 2005, Practical Assessment,
+#    Research & Evaluation 10(7)).
+#
+#    NUMBER OF FACTORS: taking the raw parallel-analysis count (n_fact_
+#    suggested) on faith is exactly what over-extracted in the pilot run of
+#    this script -- 14 factors were suggested, one of which (a 2-item
+#    factor) had Cronbach's alpha = -0.20, a textbook over-extraction
+#    artifact rather than a real need dimension (parallel analysis alone
+#    routinely over-extracts: Fabrigar et al., 1999; Costello & Osborne,
+#    2005). Rather than hard-coding any fixed k, every k from FACTOR_MIN up
+#    to the parallel-analysis count is fitted and screened for
+#    INTERPRETABILITY -- n_fact_suggested is used only as the search
+#    ceiling (the largest k the data statistically supports), not a target.
+#    The selected k is the largest (most granular, i.e. most effective)
+#    solution with zero degenerate factors, where degenerate = fewer than 3
+#    salient-loading items, reliability below ALPHA_MIN, or a Heywood case
+#    (communality > 1, a sign of an improper/unstable solution).
+#
+#    FACTOR_MIN = 4: a purely statistical search run without a floor
+#    previously selected as few as 2-3 factors as "fully clean" -- correct
+#    by the degeneracy criteria, but too coarse to be commercially useful
+#    (a 3-factor solution left ~30% of the 80-item pool's items unassigned to any
+#    factor, and collapsed conceptually distinct blocks like C5c supplier-
+#    relationship items and F5 future-priority items into one giant
+#    factor). A floor of 4 keeps the search from collapsing to a solution
+#    that's too blunt for the 4-6 segment structure the WBS scope calls
+#    for, while still letting the data pick anything >=4 that is fully
+#    interpretable. FACTOR_MIN = 4 is carried over unchanged from
+#    02_Reduction_Stage.Rmd (not re-derived from a fresh pilot on this
+#    45-item pool) so the two pipelines remain directly comparable.
+# ------------------------------------------------------------------------
+FACTOR_MIN <- 4
+
+# --- Reliability helper: reverse-score before computing alpha -----------
+# psych::alpha() assumes every item already points the same direction; fed
+# unreversed items it prints "Some items ... were negatively correlated
+# with the first principal component and probably should be reversed" and
+# quietly returns a deflated (sometimes negative) alpha. This happened
+# repeatedly in the pilot run -- e.g. the k=5 solution's "junk" 2-item
+# factor (BYOD support, loading +0.457; Cloud-based storage adoption,
+# loading -0.429) produced alpha = 0.01 purely from the sign mismatch, not
+# because the items are unrelated. `check.keys=TRUE` would fix this via
+# psych's own item-total-correlation heuristic, but that heuristic is
+# recomputed from scratch on just the member-item subset and can disagree
+# with the actual EFA loading sign, especially in small groups (exactly
+# the groups most likely to be mislabelled "degenerate"). Instead, flip
+# the sign of any item using ITS OWN loading sign on the factor it was
+# assigned to -- auditable directly from the loadings table, and
+# consistent with the polarity-harmonisation logic already applied in
+# Section 3.2. Multiplying a column by -1 before computing alpha is
+# mathematically the same operation check.keys=TRUE performs internally.
+alpha_reverse_scored <- function(raw_data, member_vars, loading_signs) {
+  item_data <- raw_data[, member_vars, drop = FALSE]
+  flip <- member_vars[loading_signs < 0]
+  if (length(flip) > 0) item_data[flip] <- -1 * item_data[flip]
+  suppressWarnings(psych::alpha(item_data, check.keys = FALSE))
+}
+
+evaluate_fa_k <- function(k) {
+  fit <- tryCatch(
+    suppressWarnings(psych::fa(needs_ws1_rho, nfactors = k, n.obs = n_obs_ws1,
+                                rotate = "oblimin", fm = "minres")),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NULL)
+
+  heywood <- any(fit$communality > 1.001, na.rm = TRUE)
+
+  load_df <- as.data.frame(unclass(fit$loadings))
+  k_cols  <- names(load_df)
+  load_df$variable <- rownames(load_df)
+
+  assign_k <- function(row) {
+    vals <- as.numeric(row[k_cols])
+    best <- which.max(abs(vals))
+    if (abs(vals[best]) >= LOADING_CUTOFF) k_cols[best] else NA_character_
+  }
+  load_df$assigned <- apply(load_df[k_cols], 1, assign_k)
+
+  rel <- purrr::map_dfr(k_cols, function(fc) {
+    member_rows <- load_df[load_df$assigned == fc & !is.na(load_df$assigned), ]
+    member_vars <- member_rows$variable
+    if (length(member_vars) < 3) {
+      return(tibble::tibble(factor = fc, n_items = length(member_vars),
+                             cronbach_alpha = NA_real_, reliable = FALSE))
+    }
+    loading_signs <- sign(member_rows[[fc]])
+    a <- alpha_reverse_scored(needs_ws1_raw, member_vars, loading_signs)
+    tibble::tibble(factor = fc, n_items = length(member_vars),
+                   cronbach_alpha = a$total$raw_alpha,
+                   reliable = isTRUE(a$total$raw_alpha >= ALPHA_MIN))
+  })
+
+  list(k = k, fit = fit, heywood = heywood,
+       n_degenerate = sum(!rel$reliable) + as.integer(heywood),
+       n_unassigned = sum(is.na(load_df$assigned)),
+       min_alpha = suppressWarnings(min(rel$cronbach_alpha, na.rm = TRUE)))
+}
+
+if (n_fact_suggested < FACTOR_MIN) {
+  stop("Parallel analysis suggests only ", n_fact_suggested, " factor(s), ",
+       "below the FACTOR_MIN = ", FACTOR_MIN, " floor -- the factor-count ",
+       "search below needs a ceiling of at least ", FACTOR_MIN, ". Inspect ",
+       "the parallel-analysis plot/eigenvalues directly; FACTOR_MIN may ",
+       "need lowering for this dataset.")
+}
+k_candidates <- FACTOR_MIN:n_fact_suggested   # NB: safe only because n_fact_suggested
+                                                # >= FACTOR_MIN is checked above -- e.g.
+                                                # "4:3" would otherwise silently evaluate
+                                                # to c(4, 3) in R, not an empty range.
+fa_search <- purrr::compact(purrr::map(k_candidates, evaluate_fa_k))
+names(fa_search) <- vapply(fa_search, function(r) as.character(r$k), character(1))
+
+fa_search_summary <- purrr::map_dfr(fa_search, function(res) {
+  tibble::tibble(k = res$k, heywood_case = res$heywood,
+                 n_degenerate_factors = res$n_degenerate,
+                 n_unassigned_items = res$n_unassigned,
+                 min_factor_alpha = round(res$min_alpha, 3))
+})
+cat("Factor-count search (k =", FACTOR_MIN, "to", n_fact_suggested,
+    "parallel-analysis ceiling):\n")
+print(fa_search_summary)
+
+clean_k <- fa_search_summary$k[fa_search_summary$n_degenerate_factors == 0]
+if (length(clean_k) > 0) {
+  n_fact_optimal <- max(clean_k)
+} else {
+  min_degen <- min(fa_search_summary$n_degenerate_factors)
+  n_fact_optimal <- max(fa_search_summary$k[fa_search_summary$n_degenerate_factors == min_degen])
+  cat("WARNING: no k in the search range produced a fully clean solution;",
+      "selected k =", n_fact_optimal, "minimises degenerate factors (",
+      min_degen, ").\n")
+}
+cat("Selected", n_fact_optimal, "factor(s) of", n_fact_suggested,
+    "possible: the largest, most granular solution with zero degenerate",
+    "factors (<3 salient items, alpha <", ALPHA_MIN, ", or a Heywood case).\n")
+
+tryCatch({
+  search_plot <- ggplot2::ggplot(fa_search_summary,
+        ggplot2::aes(x = k, y = n_degenerate_factors, fill = k == n_fact_optimal)) +
+    ggplot2::geom_col() +
+    ggplot2::scale_fill_manual(values = c("TRUE" = "#2166AC", "FALSE" = "grey70"), guide = "none") +
+    ggplot2::scale_x_continuous(breaks = fa_search_summary$k) +
+    ggplot2::labs(title = "Factor-count search: interpretability screening",
+                  subtitle = paste0("Selected k = ", n_fact_optimal,
+                                     " -- largest k with zero degenerate factors"),
+                  x = "Number of factors (k)",
+                  y = "Degenerate factors (<3 items, low alpha, or Heywood case)") +
+    ggplot2::theme_minimal(base_size = 11)
+  print(search_plot)
+  ggplot2::ggsave(file.path(output_dir, "reduction_fa_factor_count_search.png"),
+                   plot = search_plot, width = 8, height = 5, dpi = 300)
+}, error = function(e) cat("Factor-count search chart skipped:", conditionMessage(e), "\n"))
+
+# ------------------------------------------------------------------------
+# 8b. SIDE-BY-SIDE OUTPUT FOR k = 4, 5, 6, 7
+#     The automated screen above picks ONE k (n_fact_optimal) to feed the
+#     rest of the pipeline. Per request, full loadings + reliability output
+#     is also produced for k = 4, 5, 6 and 7 specifically so the choice can
+#     be reviewed by eye (item coverage, conceptual coherence of each
+#     factor) rather than relying solely on the degeneracy screen -- this
+#     matters given the "use all items as far as possible" goal, since the
+#     degeneracy screen alone doesn't penalise a high count of unassigned
+#     (uncaptured) items. Re-uses the model fits already computed in
+#     fa_search above rather than re-running psych::fa().
+# ------------------------------------------------------------------------
+k_report <- intersect(c(4, 5, 6, 7), as.integer(names(fa_search)))
+if (length(k_report) < 4) {
+  cat("NOTE: only k =", paste(k_report, collapse = ", "),
+      "are available (parallel-analysis ceiling =", n_fact_suggested,
+      "); requested 4-7.\n")
+}
+
+build_fa_output <- function(k_chr) {
+  fit    <- fa_search[[k_chr]]$fit
+  k_cols <- colnames(unclass(fit$loadings))
+
+  loadings_df <- as.data.frame(unclass(fit$loadings)) %>%
+    tibble::rownames_to_column("variable") %>%
+    mutate(item_label = unname(all_blocks[variable]))
+
+  assign_k <- function(row) {
+    vals <- as.numeric(row[k_cols])
+    best <- which.max(abs(vals))
+    if (abs(vals[best]) >= LOADING_CUTOFF) k_cols[best] else NA_character_
+  }
+  loadings_df$assigned_factor <- apply(loadings_df[k_cols], 1, assign_k)
+
+  reliability_df <- purrr::map_dfr(k_cols, function(fc) {
+    member_rows <- loadings_df[loadings_df$assigned_factor == fc & !is.na(loadings_df$assigned_factor), ]
+    member_vars <- member_rows$variable
+    if (length(member_vars) < 2) {
+      return(tibble::tibble(factor = fc, n_items = length(member_vars),
+                             items = paste(unname(all_blocks[member_vars]), collapse = "; "),
+                             cronbach_alpha = NA_real_, reliable = FALSE))
+    }
+    loading_signs <- sign(member_rows[[fc]])
+    a <- alpha_reverse_scored(needs_ws1_raw, member_vars, loading_signs)
+    tibble::tibble(factor = fc, n_items = length(member_vars),
+                   items = paste(unname(all_blocks[member_vars]), collapse = "; "),
+                   cronbach_alpha = round(a$total$raw_alpha, 3),
+                   reliable = isTRUE(a$total$raw_alpha >= ALPHA_MIN))
+  })
+
+  n_unassigned_k <- sum(is.na(loadings_df$assigned_factor))
+  cat("\n--- k =", k_chr, "factors ---\n")
+  cat(n_unassigned_k, "of", nrow(loadings_df), "items unassigned (no loading >=",
+      LOADING_CUTOFF, "on any factor)\n")
+  print(reliability_df[, c("factor", "n_items", "cronbach_alpha", "reliable")])
+
+  tryCatch({
+    load_long <- loadings_df %>%
+      tidyr::pivot_longer(cols = dplyr::all_of(k_cols), names_to = "factor", values_to = "loading") %>%
+      mutate(loading_display = ifelse(abs(loading) >= LOADING_CUTOFF, loading, NA_real_),
+             variable = factor(variable, levels = rev(needs_ws1_vars)),
+             factor = factor(factor, levels = k_cols))
+
+    heatmap_k <- ggplot2::ggplot(load_long,
+          ggplot2::aes(x = factor, y = variable, fill = loading_display)) +
+      ggplot2::geom_tile(color = "grey90") +
+      ggplot2::scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                                     midpoint = 0, na.value = "grey95",
+                                     limits = c(-1, 1), name = "Loading") +
+      ggplot2::labs(title = paste0("EFA loadings heatmap -- k = ", k_chr, " factors"),
+                    subtitle = paste0(n_unassigned_k, " of 45 items unassigned (|loading| < ",
+                                       LOADING_CUTOFF, ")"),
+                    x = NULL, y = NULL) +
+      ggplot2::theme_minimal(base_size = 5) +
+      ggplot2::theme(panel.grid = ggplot2::element_blank())
+    print(heatmap_k)
+    ggplot2::ggsave(file.path(output_dir, paste0("reduction_fa_loadings_heatmap_k", k_chr, ".png")),
+                     plot = heatmap_k, width = 7, height = 16, dpi = 300)
+  }, error = function(e) cat("k =", k_chr, "loadings heatmap skipped:", conditionMessage(e), "\n"))
+
+  list(k = as.integer(k_chr), loadings_df = loadings_df,
+       reliability_df = reliability_df, n_unassigned = n_unassigned_k)
+}
+
+fa_outputs_by_k <- purrr::map(as.character(k_report), build_fa_output)
+names(fa_outputs_by_k) <- as.character(k_report)
+
+k_comparison <- purrr::map_dfr(fa_outputs_by_k, function(res) {
+  tibble::tibble(k = res$k,
+                 n_items_assigned = nrow(res$loadings_df) - res$n_unassigned,
+                 n_unassigned_items = res$n_unassigned,
+                 n_factors_reliable = sum(res$reliability_df$reliable, na.rm = TRUE),
+                 mean_alpha = round(mean(res$reliability_df$cronbach_alpha, na.rm = TRUE), 3),
+                 min_alpha = round(min(res$reliability_df$cronbach_alpha, na.rm = TRUE), 3))
+})
+cat("\nComparison across k = 4, 5, 6, 7 (item coverage vs reliability trade-off):\n")
+print(k_comparison)
+
+fa_res <- fa_search[[as.character(n_fact_optimal)]]$fit
+print(fa_res$loadings, cutoff = LOADING_CUTOFF, sort = TRUE)
+
+fa_loadings_df <- as.data.frame(unclass(fa_res$loadings)) %>%
+  tibble::rownames_to_column("variable") %>%
+  mutate(item_label = unname(all_blocks[variable]))
+
+fac_cols <- setdiff(names(fa_loadings_df), c("variable", "item_label"))
+assign_factor <- function(row) {
+  vals <- as.numeric(row[fac_cols])
+  best <- which.max(abs(vals))
+  if (abs(vals[best]) >= LOADING_CUTOFF) fac_cols[best] else NA_character_
+}
+fa_loadings_df$assigned_factor <- apply(fa_loadings_df[fac_cols], 1, assign_factor)
+
+# Loadings heatmap: same purpose as the PCA one in Section 7, but for the
+# oblique-rotated common-factor solution that Section 9 argues is the
+# theoretically preferred input to clustering.
+tryCatch({
+  fa_load_long <- fa_loadings_df %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(fac_cols), names_to = "factor", values_to = "loading") %>%
+    mutate(loading_display = ifelse(abs(loading) >= LOADING_CUTOFF, loading, NA_real_),
+           variable = factor(variable, levels = rev(needs_ws1_vars)),
+           factor = factor(factor, levels = fac_cols))
+
+  fa_loadings_heatmap <- ggplot2::ggplot(fa_load_long,
+        ggplot2::aes(x = factor, y = variable, fill = loading_display)) +
+    ggplot2::geom_tile(color = "grey90") +
+    ggplot2::scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                                   midpoint = 0, na.value = "grey95",
+                                   limits = c(-1, 1), name = "Loading") +
+    ggplot2::labs(title = "EFA loadings heatmap (oblimin, minres)",
+                  subtitle = paste0("Blank cells: |loading| < ", LOADING_CUTOFF, " cutoff"),
+                  x = NULL, y = NULL) +
+    ggplot2::theme_minimal(base_size = 5) +
+    ggplot2::theme(panel.grid = ggplot2::element_blank())
+  print(fa_loadings_heatmap)
+  ggplot2::ggsave(file.path(output_dir, "reduction_fa_loadings_heatmap.png"),
+                   plot = fa_loadings_heatmap, width = 8, height = 16, dpi = 300)
+}, error = function(e) cat("FA loadings heatmap skipped:", conditionMessage(e), "\n"))
+
+# Inter-factor correlation (oblimin Phi matrix): the empirical check on the
+# a-priori rationale given in the chunk header for choosing oblique over
+# orthogonal rotation. Non-trivial off-diagonal |phi| values here are the
+# evidence that correlated need dimensions were the right assumption.
+tryCatch({
+  phi_mat <- fa_res$Phi
+  if (!is.null(phi_mat)) {
+    colnames(phi_mat) <- fac_cols
+    rownames(phi_mat) <- fac_cols
+    phi_long <- as.data.frame(phi_mat) %>%
+      tibble::rownames_to_column("factor1") %>%
+      tidyr::pivot_longer(-factor1, names_to = "factor2", values_to = "phi") %>%
+      mutate(factor1 = factor(factor1, levels = fac_cols),
+             factor2 = factor(factor2, levels = rev(fac_cols)))
+
+    factor_cor_heatmap <- ggplot2::ggplot(phi_long, ggplot2::aes(factor1, factor2, fill = phi)) +
+      ggplot2::geom_tile() +
+      ggplot2::geom_text(ggplot2::aes(label = round(phi, 2)), size = 3) +
+      ggplot2::scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                                     midpoint = 0, limits = c(-1, 1), name = "phi") +
+      ggplot2::labs(title = "Inter-factor correlations (oblimin Phi matrix)",
+                    subtitle = "Non-trivial |phi| values justify oblique over orthogonal rotation",
+                    x = NULL, y = NULL) +
+      ggplot2::theme_minimal(base_size = 11)
+    print(factor_cor_heatmap)
+    ggplot2::ggsave(file.path(output_dir, "reduction_fa_factor_correlations.png"),
+                     plot = factor_cor_heatmap, width = 7, height = 6, dpi = 300)
+  }
+}, error = function(e) cat("Factor-correlation heatmap skipped:", conditionMessage(e), "\n"))
+
+# Reliability per retained factor (classical alpha on the harmonised raw
+# items assigned to it -- reported as the conventional reliability index,
+# consistent with Workstream 1; note alpha's continuous-data assumption is
+# a simplification for the binary/ordinal items it may include).
+factor_reliability <- purrr::map_dfr(fac_cols, function(fc) {
+  member_rows <- fa_loadings_df[fa_loadings_df$assigned_factor == fc & !is.na(fa_loadings_df$assigned_factor), ]
+  member_vars <- member_rows$variable
+  if (length(member_vars) < 2) return(NULL)
+  loading_signs <- sign(member_rows[[fc]])
+  alpha_res <- alpha_reverse_scored(needs_ws1_raw, member_vars, loading_signs)
+  tibble(factor = fc, n_items = length(member_vars),
+         items = paste(unname(all_blocks[member_vars]), collapse = "; "),
+         cronbach_alpha = round(alpha_res$total$raw_alpha, 3),
+         reliable = alpha_res$total$raw_alpha >= ALPHA_MIN)
+})
+print(factor_reliability)
+
+# Reliability bar chart -- flags at a glance which retained factors clear
+# the Nunnally (1978) alpha floor and which don't, ahead of naming/labelling
+# them for client stakeholders.
+tryCatch({
+  if (nrow(factor_reliability) > 0) {
+    alpha_plot <- ggplot2::ggplot(factor_reliability,
+          ggplot2::aes(x = reorder(factor, cronbach_alpha), y = cronbach_alpha, fill = reliable)) +
+      ggplot2::geom_col() +
+      ggplot2::geom_hline(yintercept = ALPHA_MIN, linetype = "dashed") +
+      ggplot2::scale_fill_manual(values = c("TRUE" = "#2166AC", "FALSE" = "#B2182B"),
+                                  name = paste0("alpha >= ", ALPHA_MIN)) +
+      ggplot2::coord_flip() +
+      ggplot2::labs(title = "Cronbach's alpha by retained factor",
+                    subtitle = paste("Dashed line = Nunnally (1978) floor of", ALPHA_MIN),
+                    x = NULL, y = "Cronbach's alpha") +
+      ggplot2::theme_minimal(base_size = 11)
+    print(alpha_plot)
+    ggplot2::ggsave(file.path(output_dir, "reduction_fa_reliability.png"),
+                     plot = alpha_plot, width = 8, height = 5, dpi = 300)
+  }
+}, error = function(e) cat("Reliability chart skipped:", conditionMessage(e), "\n"))
+
+# Respondent-level factor scores via Thurstone regression scoring on the
+# mixed correlation matrix (Grice, 2001) -- the psychometrically correct
+# way to obtain scores when extraction used a correlation matrix rather
+# than raw continuous data directly.
+#
+# TWO CORRECTIONS vs a naive implementation, both needed after switching to
+# an oblique (oblimin) rotation:
+#   1. Thurstone regression scoring for OBLIQUE factors uses the STRUCTURE
+#      matrix (pattern loadings x Phi, i.e. the actual item-factor
+#      correlations), not the raw pattern loadings -- using pattern alone
+#      is a common but incorrect shortcut that's only equivalent to the
+#      structure matrix when factors are orthogonal (Grice, 2001).
+#   2. MASS::ginv() replaces solve() for the same near-singularity reason
+#      as the PCA weights above -- this is what actually fixed the
+#      hundreds-of-millions-magnitude factor scores seen in the pilot run.
+fa_structure <- unclass(fa_res$loadings) %*% fa_res$Phi
+fa_weights <- MASS::ginv(needs_ws1_rho) %*% fa_structure
+fa_scores <- needs_ws1_z %*% fa_weights
+colnames(fa_scores) <- paste0("Factor", seq_len(ncol(fa_scores)))
+
+fa_score_range <- range(fa_scores)
+cat("FA score range:", round(fa_score_range[1], 2), "to",
+    round(fa_score_range[2], 2), "\n")
+if (max(abs(fa_score_range)) > 20) {
+  cat("WARNING: FA scores exceed a plausible range for standardised factor",
+      "scores (expected roughly -5 to +5) -- inspect needs_ws1_rho",
+      "conditioning and fa_res$Phi before trusting these scores.\n")
+}
+```
+
+```{r pca-vs-fa}
+# ------------------------------------------------------------------------
+# 9. PCA vs FA: WHICH REDUCTION FEEDS THE CLUSTERING STAGE?
+#    Congruence between the two solutions is checked via the correlation
+#    between each pair of PC/Factor score vectors -- high congruence means
+#    the choice matters little for clustering; material divergence means
+#    the choice should be justified explicitly in the Methodology chapter
+#    (PCA = variance-maximising composites incl. unique/error variance;
+#    FA = common-variance-only latent need dimensions, arguably the more
+#    theoretically appropriate choice for a *needs* construct -- Fabrigar,
+#    Wegener, MacCallum & Strahan, 1999, Psychological Methods 4(3)).
+# ------------------------------------------------------------------------
+score_congruence <- cor(pca_scores, fa_scores, use = "pairwise.complete.obs")
+cat("PCA-component x FA-factor score correlations:\n")
+print(round(score_congruence, 2))
+
+# Congruence heatmap: a clean, near-diagonal, high-|r| pattern is the
+# visual case for "PCA vs FA choice barely matters for clustering"; a
+# scattered pattern is the visual case for the opposite, and either way is
+# easier to defend from a picture than from a bare correlation matrix.
+tryCatch({
+  congruence_long <- as.data.frame(score_congruence) %>%
+    tibble::rownames_to_column("pc") %>%
+    tidyr::pivot_longer(-pc, names_to = "factor", values_to = "r") %>%
+    mutate(pc = factor(pc, levels = rev(rownames(score_congruence))),
+           factor = factor(factor, levels = colnames(score_congruence)))
+
+  congruence_heatmap <- ggplot2::ggplot(congruence_long, ggplot2::aes(factor, pc, fill = r)) +
+    ggplot2::geom_tile() +
+    ggplot2::geom_text(ggplot2::aes(label = round(r, 2)), size = 3) +
+    ggplot2::scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                                   midpoint = 0, limits = c(-1, 1), name = "r") +
+    ggplot2::labs(title = "PCA-component x FA-factor score congruence",
+                  subtitle = "Diagonal-dominant, high |r| -> PCA/FA choice largely immaterial for clustering",
+                  x = "FA factor", y = "PCA component") +
+    ggplot2::theme_minimal(base_size = 11)
+  print(congruence_heatmap)
+  ggplot2::ggsave(file.path(output_dir, "reduction_pca_fa_congruence.png"),
+                   plot = congruence_heatmap, width = 7, height = 6, dpi = 300)
+}, error = function(e) cat("Congruence heatmap skipped:", conditionMessage(e), "\n"))
+```
+
+```{r save-outputs}
+# ------------------------------------------------------------------------
+# 10. SAVE OUTPUTS FOR THE CLUSTERING STAGE
+# ------------------------------------------------------------------------
+respondent_scores <- bind_cols(
+  tibble(respondent_row = seq_len(nrow(needs_ws1_raw)), uuid = df$uuid),
+  as_tibble(pca_scores),
+  as_tibble(fa_scores)
+)
+
+# Per-k (4/5/6/7) loadings + reliability sheets, built from fa_outputs_by_k
+# (Section 8b) so the side-by-side comparison is inspectable directly in
+# the workbook, not just in the console/plots.
+k_sheets <- list()
+for (k_nm in names(fa_outputs_by_k)) {
+  k_sheets[[paste0("FA Loadings k", k_nm)]]    <- fa_outputs_by_k[[k_nm]]$loadings_df
+  k_sheets[[paste0("FA Reliability k", k_nm)]] <- fa_outputs_by_k[[k_nm]]$reliability_df
+}
+
+writexl::write_xlsx(
+  c(
+    list(
+      "Respondent PCA+FA Scores"  = respondent_scores,
+      "PCA Loadings"              = pca_loadings_df,
+      "FA Loadings (selected k)"  = fa_loadings_df,
+      "FA Factor Reliability"     = factor_reliability,
+      "PCA-FA Score Congruence"   = as.data.frame(score_congruence) %>%
+        tibble::rownames_to_column("PC"),
+      "Factor Count Search"       = fa_search_summary,
+      "FA k=4-7 Comparison"       = k_comparison
+    ),
+    k_sheets,
+    list(
+      "Suitability Diagnostics"   = tibble(
+        metric = c("Overall KMO", "Bartlett chi-sq", "Bartlett df", "Bartlett p",
+                   "Correlation matrix smoothed (non-PD)",
+                   "N components (PCA, parallel analysis)",
+                   "N factors (EFA, parallel analysis ceiling)",
+                   "N factors (EFA, selected after interpretability screening)",
+                   "Respondents with >=1 missing item (median-imputed for scoring)"),
+        value = c(round(kmo_res$MSA, 3), round(bart_res$chisq, 1), bart_res$df,
+                  signif(bart_res$p.value, 3), n_negative_eig > 0,
+                  n_comp_suggested, n_fact_suggested, n_fact_optimal,
+                  n_incomplete_resp)
+      )
+    )
+  ),
+  path = file.path(output_dir, "Workstream2c_Reduction_Stage_WS1Needs.xlsx")
+)
+
+## NOTE: needs_ws1_raw/pca_scores/fa_scores carry no respondent identifier of
+## their own (they are built by positional subsetting of `df`, which is
+## itself already filtered to status == "Qualified" -- see Section 2). The
+## Clustering Stage script reads its own copy of the raw survey file and
+## must NOT rely on row position matching across two independent script
+## runs/imports -- so `uuid` (plus the firmographic variables the
+## Clustering Stage's external-validation step needs: S2/S3/S4/S5a/S5b/D3)
+## is saved alongside the scores here, and the Clustering Stage joins on
+## `uuid` explicitly rather than assuming row order.
+## `all_blocks` (variable code -> descriptive questionnaire label, e.g.
+## "F1r2" -> "Sovereign cloud") is the SAME lookup already used throughout
+## this script to build every "item_label" column in the xlsx output above
+## -- saved here too so the Clustering Stage can label variables with the
+## exact same descriptive text, rather than re-typing/re-deriving labels
+## that could drift out of sync with this script's own wording.
+##
+## `factor_reliability` (per-factor Cronbach's alpha + the ALPHA_MIN
+## reliability flag, computed above in Section 8) is saved too, so the
+## Clustering Stage can flag which of a segment's "defining" factors are
+## backed by a genuinely reliable construct -- e.g. the 2-item MR2 factor
+## (BYOD support + Cloud storage, alpha = -0.01) should not read the same
+## as a 19-item, alpha = 0.94 factor when a stakeholder is reading which
+## variables define a segment.
+saveRDS(list(needs_ws1_raw = needs_ws1_raw, needs_ws1_rho = needs_ws1_rho,
+             pca_res = pca_res, fa_res = fa_res,
+             pca_scores = pca_scores, fa_scores = fa_scores,
+             uuid = df$uuid,
+             firmographics = df[, c("uuid", "S2", "S3", "S4", "S5a", "S5b", "D3")],
+             item_labels = all_blocks,
+             factor_reliability = factor_reliability),
+        file.path(output_dir, "reduction_stage_objects_ws1needs.rds"))
+
+cat("\nOutputs written to:", normalizePath(output_dir), "\n")
+cat("-> Workstream2c_Reduction_Stage_WS1Needs.xlsx (loadings, reliability, diagnostics, scores)\n")
+cat("-> reduction_stage_objects_ws1needs.rds (full R objects for the Clustering stage script)\n")
+```
